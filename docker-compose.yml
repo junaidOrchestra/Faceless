@@ -1,0 +1,38 @@
+# Local development stack. Postgres is provided externally (e.g. Neon) via each
+# service's DATABASE_URL, so no local Postgres container is required.
+services:
+  clip-server:
+    build:
+      context: ./clip-server
+    environment:
+      DATABASE_URL: ${CLIP_DATABASE_URL}
+      API_AUTH_SECRET: ${CLIP_API_AUTH_SECRET}
+      ENABLED_SOURCES: '["pexels_photo"]'
+      # ENABLED_SOURCES: '["wikimedia"]'
+      LOG_LEVEL: DEBUG
+    ports:
+      - "7860:7860"
+
+  orchestrator:
+    build:
+      context: ./orchestrator
+    environment:
+      DATABASE_URL: ${ORCHESTRATOR_DATABASE_URL}
+      API_AUTH_SECRET: ${ORCHESTRATOR_API_AUTH_SECRET}
+      CLIP_SERVER_URL: http://clip-server:7860
+      CLIP_SERVER_SECRET: ${CLIP_API_AUTH_SECRET}
+      LLM_PROVIDER: cerebras
+      # Provide CEREBRAS_API_KEY via your shell env or a root .env file.
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      CEREBRAS_MODEL: gpt-oss-120b
+      LLM_MAX_TOKENS: "8192"
+      LLM_REASONING_EFFORT: low
+      # 0 = retry LLM timeouts indefinitely (with capped backoff).
+      LLM_MAX_RETRIES: "0"
+      ALLOWED_ORIGINS: '["http://localhost:3000"]'
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    depends_on:
+      clip-server:
+        condition: service_started

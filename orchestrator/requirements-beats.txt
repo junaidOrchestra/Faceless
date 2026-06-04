@@ -1,0 +1,7 @@
+# Minimal local dependencies for:
+#
+#   python inspect_beats.py path/to/narration.mp3
+#
+# No FastAPI, DB, LLM, CLIP client, or renderer dependencies are needed.
+faster-whisper==1.1.0
+pysbd==0.3.4

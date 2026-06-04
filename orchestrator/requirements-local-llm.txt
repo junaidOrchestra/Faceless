@@ -1,0 +1,8 @@
+# Optional local GGUF LLM support.
+#
+# This dependency frequently builds native code and can fail on machines without
+# a compiler toolchain. Install only when using LLM_PROVIDER=local.
+#
+# Windows note: prefer Python 3.11/3.12 and a prebuilt wheel, or install Visual
+# Studio Build Tools / CMake first.
+llama-cpp-python==0.3.4
