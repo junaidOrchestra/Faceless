@@ -124,11 +124,14 @@ async def create_job(
 @app.get(
     "/jobs/{job_id}",
     response_model=JobStatusResponse,
+    response_model_exclude_none=True,
     tags=["jobs"],
     summary="Poll job status and fetch results",
     description=(
-        "While processing, status is queued or running. When done, ranked assets are "
-        "included in this response. After a successful fetch the job is pruned."
+        "While the job is queued/running, returns status only (no payload). On "
+        "failure, returns the error. The ranked assets are returned ONLY once the "
+        "whole job is complete (status=done) — never partial/mid-flight — and the "
+        "job is pruned after that first successful read (fetch-once)."
     ),
     responses={404: {"model": ErrorResponse}},
     dependencies=[Depends(require_auth)],
@@ -142,27 +145,26 @@ async def get_job(
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown job_id.")
 
-    items: list[JobItemResult] = []
-    if job.items_result:
-        items = [JobItemResult.model_validate(row) for row in job.items_result]
+    # Still working: report status only, never a (partial) payload.
+    if job.status in ("queued", "running"):
+        return JobStatusResponse(job_id=job.job_id, status=job.status)  # type: ignore[arg-type]
 
-    response = JobStatusResponse(
-        job_id=job.job_id,
-        status=job.status,  # type: ignore[arg-type]
-        items=items,
-        error=job.error,
-    )
+    # Failed: surface the error so the orchestrator can fail the video job.
+    if job.status == "failed":
+        return JobStatusResponse(
+            job_id=job.job_id, status="failed", error=job.error or "CLIP job failed"
+        )
 
-    # Prune after the client successfully reads a terminal job (fetch-once semantics).
-    if job.status == "done" and getattr(request.app.state, "prune_on_fetch", True):
+    # Done: the complete ranked result is ready. Return it once, then prune.
+    items = [JobItemResult.model_validate(row) for row in (job.items_result or [])]
+    if getattr(request.app.state, "prune_on_fetch", True):
         logger.info(
             "job %s processed: %s",
             job_id,
             [item.get("keyword") for item in (job.items_input or {}).get("items", [])],
         )
         await job_service.prune_job(session, job_id)
-
-    return response
+    return JobStatusResponse(job_id=job.job_id, status="done", items=items)
 
 
 @app.post(

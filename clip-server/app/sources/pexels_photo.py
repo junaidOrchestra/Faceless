@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 
-from .base import Candidate, StockSource
+from .base import Candidate, StockSource, resolve_quality
 from .registry import register_source
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,7 @@ class PexelsPhotoSource(StockSource):
     name = "pexels_photo"
     platform = "pexels"
     requires_key = True
+    credential_key = "pexels"
     media_kinds = ("photo",)
 
     async def search(
@@ -51,11 +52,17 @@ class PexelsPhotoSource(StockSource):
         response.raise_for_status()
         payload = response.json()
 
+        quality = resolve_quality(options)
         candidates: list[Candidate] = []
         for photo in payload.get("photos", [])[:n]:
             src = photo.get("src") or {}
             preview = src.get("medium") or src.get("small") or src.get("original")
-            media = src.get("large2x") or src.get("large") or src.get("original")
+            if quality == "sd":
+                media = src.get("large") or src.get("medium") or src.get("original")
+            elif quality == "max":
+                media = src.get("original") or src.get("large2x") or src.get("large")
+            else:  # hd
+                media = src.get("large2x") or src.get("large") or src.get("original")
             if not preview or not media:
                 continue
             candidates.append(

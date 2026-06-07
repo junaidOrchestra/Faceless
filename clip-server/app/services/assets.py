@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-from sqlalchemy import select
+from sqlalchemy import or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Asset
@@ -21,6 +22,28 @@ async def get_cached_asset(
         select(Asset).where(Asset.platform == platform, Asset.external_id == external_id)
     )
     return result.scalar_one_or_none()
+
+
+async def get_cached_assets_by_keys(
+    session: AsyncSession,
+    keys: set[tuple[str, str]],
+) -> dict[tuple[str, str], Asset]:
+    """Return cached assets keyed by ``(platform, external_id)``.
+
+    Used after source search to avoid re-downloading/re-embedding candidates
+    whose preview embedding is already in the asset cache.
+    """
+
+    if not keys:
+        return {}
+    clauses = [
+        (Asset.platform == platform) & (Asset.external_id == external_id)
+        for platform, external_id in keys
+    ]
+    # SQLAlchemy's tuple IN support varies by backend/dialect configuration with
+    # vector columns in this stack, so build an OR expression explicitly.
+    result = await session.execute(select(Asset).where(or_(*clauses)))
+    return {(asset.platform, asset.external_id): asset for asset in result.scalars()}
 
 
 async def search_cached_assets(
@@ -64,41 +87,49 @@ async def upsert_asset(
     embedding: np.ndarray,
     keyword: str,
 ) -> Asset:
-    """Insert or refresh a cached asset row (embedding updated on conflict)."""
+    """Insert or refresh a cached asset row (embedding updated on conflict).
 
-    existing = await get_cached_asset(session, candidate.platform, candidate.external_id)
+    Uses Postgres ``INSERT ... ON CONFLICT`` so this is atomic and safe under
+    concurrent item processing: if two items embed the same ``(platform,
+    external_id)`` at once, one inserts and the other updates rather than racing
+    a SELECT-then-INSERT into a unique-constraint violation.
+    """
+
     vector = embedding.astype(np.float32).tolist()
-
-    if existing is not None:
-        existing.media_url = candidate.media_url
-        existing.preview_url = candidate.preview_url
-        existing.attribution_name = candidate.attribution_name
-        existing.attribution_url = candidate.attribution_url
-        existing.license = candidate.license
-        existing.duration = candidate.duration
-        existing.embedding = vector
-        existing.keyword = keyword
-        await session.commit()
-        await session.refresh(existing)
-        return existing
-
-    asset = Asset(
-        platform=candidate.platform,
-        external_id=candidate.external_id,
-        kind=candidate.kind,
-        media_url=candidate.media_url,
-        preview_url=candidate.preview_url,
-        attribution_name=candidate.attribution_name,
-        attribution_url=candidate.attribution_url,
-        license=candidate.license,
-        duration=candidate.duration,
-        embedding=vector,
-        keyword=keyword,
+    values = {
+        "platform": candidate.platform,
+        "external_id": candidate.external_id,
+        "kind": candidate.kind,
+        "media_url": candidate.media_url,
+        "preview_url": candidate.preview_url,
+        "attribution_name": candidate.attribution_name,
+        "attribution_url": candidate.attribution_url,
+        "license": candidate.license,
+        "duration": candidate.duration,
+        "embedding": vector,
+        "keyword": keyword,
+    }
+    stmt = pg_insert(Asset).values(**values)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["platform", "external_id"],
+        set_={
+            "media_url": stmt.excluded.media_url,
+            "preview_url": stmt.excluded.preview_url,
+            "attribution_name": stmt.excluded.attribution_name,
+            "attribution_url": stmt.excluded.attribution_url,
+            "license": stmt.excluded.license,
+            "duration": stmt.excluded.duration,
+            "embedding": stmt.excluded.embedding,
+            "keyword": stmt.excluded.keyword,
+        },
     )
-    session.add(asset)
+    await session.execute(stmt)
     await session.commit()
-    await session.refresh(asset)
-    return asset
+
+    # Re-read so callers get a fully-populated ORM row (incl. the generated id).
+    refreshed = await get_cached_asset(session, candidate.platform, candidate.external_id)
+    assert refreshed is not None  # just upserted
+    return refreshed
 
 
 def asset_to_ranked(asset: Asset, score: float) -> dict[str, Any]:

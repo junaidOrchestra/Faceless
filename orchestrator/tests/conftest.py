@@ -38,9 +38,11 @@ async def client() -> AsyncIterator[AsyncClient]:
         await session.execute(delete(VideoJob))
         await session.commit()
 
-    # Lifespan starts the in-process VideoWorker (stub deps via env).
-    transport = ASGITransport(app=app, lifespan="on")
-    async with AsyncClient(transport=transport, base_url="http://test") as http:
-        yield http
+    # Drive the app lifespan explicitly so the staged worker pools + clip poller
+    # start (httpx>=0.28 ASGITransport no longer manages lifespan itself).
+    transport = ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=transport, base_url="http://test") as http:
+            yield http
 
     get_settings.cache_clear()

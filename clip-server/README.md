@@ -1,3 +1,13 @@
+---
+title: Faceless CLIP Server
+emoji: 🎬
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # CLIP Server — keywords → ranked assets
 
 Beat-**agnostic** media finder: given a batch of keywords it searches stock

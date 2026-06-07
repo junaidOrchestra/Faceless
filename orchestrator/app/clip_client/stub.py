@@ -1,4 +1,9 @@
-"""In-process stub ClipClient for smoke tests."""
+"""In-process stub ClipClient for smoke tests.
+
+``submit`` records the requested items in memory keyed by job id; ``poll`` then
+returns an immediately-``done`` response with one canned asset per ref. This
+mirrors the real submit/poll split used by the staged pipeline.
+"""
 
 from __future__ import annotations
 
@@ -9,27 +14,35 @@ from .schemas import ClipJobItemResult, ClipJobStatusResponse, ClipRankedAsset
 
 
 class StubClipClient(ClipClient):
-    async def submit_and_poll(
+    def __init__(self) -> None:
+        self._jobs: dict[str, list[dict[str, Any]]] = {}
+
+    async def submit(
         self,
         job_id: str,
         items: list[dict[str, Any]],
         credentials: dict[str, str | None],
         sources: list[str] | None,
         *,
-        poll_interval_s: float,
-        poll_timeout_s: float,
-    ) -> ClipJobStatusResponse:
-        del job_id, credentials, sources, poll_interval_s, poll_timeout_s
+        orientation: str | None = None,
+        quality: str | None = None,
+    ) -> None:
+        del credentials, sources, orientation, quality
+        self._jobs[job_id] = list(items)
+
+    async def poll(self, job_id: str) -> ClipJobStatusResponse:
+        items = self._jobs.get(job_id, [])
         results: list[ClipJobItemResult] = []
         for it in items:
+            ref = str(it["ref"])
             results.append(
                 ClipJobItemResult(
-                    ref=str(it["ref"]),
+                    ref=ref,
                     assets=[
                         ClipRankedAsset(
                             platform="stub",
                             kind="photo",
-                            media_url="https://example.com/a.jpg",
+                            media_url=f"https://example.com/{ref}.jpg",
                             preview_url="stub://preview/x",
                             attribution_name="Stub",
                             attribution_url="https://example.com",
@@ -39,4 +52,4 @@ class StubClipClient(ClipClient):
                     ],
                 )
             )
-        return ClipJobStatusResponse(job_id="stub", status="done", items=results)
+        return ClipJobStatusResponse(job_id=job_id, status="done", items=results)

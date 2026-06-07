@@ -10,14 +10,18 @@ from .schemas import ClipJobStatusResponse
 
 class ClipClient(ABC):
     @abstractmethod
-    async def submit_and_poll(
+    async def submit(
         self,
         job_id: str,
         items: list[dict[str, Any]],
         credentials: dict[str, str | None],
         sources: list[str] | None,
         *,
-        poll_interval_s: float,
-        poll_timeout_s: float,
-    ) -> ClipJobStatusResponse:
-        """Submit a batch job and poll until terminal status."""
+        orientation: str | None = None,
+        quality: str | None = None,
+    ) -> None:
+        """Submit a batch job (fire-and-forget). Idempotent on ``job_id``."""
+
+    @abstractmethod
+    async def poll(self, job_id: str) -> ClipJobStatusResponse:
+        """Fetch the current status/results of a previously submitted job."""

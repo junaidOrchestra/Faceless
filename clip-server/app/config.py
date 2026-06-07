@@ -65,7 +65,14 @@ class Settings(BaseSettings):
     )
 
     # --- Input validation caps ----------------------------------------------
-    max_items_per_job: int = Field(default=64, description="Cap on items per job.")
+    max_items_per_job: int = Field(
+        default=512,
+        description=(
+            "Cap on items per job. Orchestrator may submit multiple keyword "
+            "queries per beat to improve matching quality (e.g. a long, ~70-beat "
+            "narration at 3 queries/beat is ~210 items)."
+        ),
+    )
     max_sources_per_item: int = Field(default=8, description="Cap on sources per item.")
     max_keyword_length: int = Field(default=256, description="Cap on keyword length.")
 
@@ -77,16 +84,37 @@ class Settings(BaseSettings):
     max_assets_per_item: int = Field(
         default=8, description="Cap on assets returned per item."
     )
+    item_concurrency: int = Field(
+        default=3,
+        description=(
+            "How many keyword items in a job are processed at once. Overlaps each "
+            "item's source searches + preview downloads with another item's CLIP "
+            "embedding. CLIP embedding itself is serialized (one CPU model), so "
+            "keep this modest (2-4); it mainly hides network latency, not CPU."
+        ),
+    )
     enable_cache_first: bool = Field(
-        default=True,
-        description="Reuse previously embedded assets via vector search before hitting sources.",
+        default=False,
+        description=(
+            "Reuse previously embedded assets via vector search before hitting "
+            "sources. Kept OFF by default: within one video most beats share a "
+            "topic, so cache-first makes every beat collapse onto the same handful "
+            "of cached images. Off => each beat fetches fresh, diverse results."
+        ),
     )
 
     # --- Outbound HTTP -------------------------------------------------------
     http_timeout_s: float = Field(default=20.0, description="Outbound HTTP timeout.")
     http_user_agent: str = Field(
-        default="faceless-clip-server/0.1 (+https://example.com; contact@example.com)",
-        description="User-Agent sent to sources (required by Wikimedia).",
+        default="FacelessFlow/1.0 (https://github.com/faceless-video; faceless-video@proton.me)",
+        description=(
+            "User-Agent sent to all outbound source requests. Wikimedia's "
+            "policy requires a meaningful UA with contact info "
+            "(https://meta.wikimedia.org/wiki/User-Agent_policy); a blank or "
+            "browser-like UA gets throttled/blocked. Format: "
+            "'AppName/Version (contact URL; email)'. Override via HTTP_USER_AGENT "
+            "with your own real contact details."
+        ),
     )
 
 

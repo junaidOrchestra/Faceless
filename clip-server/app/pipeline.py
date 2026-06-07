@@ -3,9 +3,9 @@
 For each job item the worker:
 
 1. Queries every enabled source (failures are isolated per source).
-2. Pools all candidates, downloads previews, batch-embeds images with CLIP.
-3. Embeds the keyword text, ranks the pool by cosine similarity.
-4. Upserts survivors into the ``assets`` cache and attaches ranked rows to the item.
+2. Pools all candidates and reuses cached embeddings for any known asset.
+3. Downloads/embeds only cache misses, then ranks by cosine similarity.
+4. Upserts new survivors into the ``assets`` cache and attaches ranked rows to the item.
 
 The opaque ``ref`` field is echoed untouched — we never parse it.
 """
@@ -19,7 +19,10 @@ from typing import Any
 
 import httpx
 import numpy as np
+from PIL import Image
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from .config import Settings
 from .embedding.base import Embedder
@@ -36,6 +39,26 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))
 
 
+async def _embed_texts(embedder: Embedder, lock: asyncio.Lock, texts: list[str]) -> np.ndarray:
+    """Embed text off the event loop, serialized so one CPU model isn't reentered.
+
+    ``embedder.embed_texts`` is a blocking, CPU-bound torch call. Running it via
+    ``to_thread`` lets other items' network I/O proceed meanwhile (torch releases
+    the GIL); the lock guarantees only one forward pass runs at a time, since a
+    single CLIP model is not safe to call concurrently.
+    """
+
+    async with lock:
+        return await asyncio.to_thread(embedder.embed_texts, texts)
+
+
+async def _embed_images(embedder: Embedder, lock: asyncio.Lock, images: list[bytes]) -> np.ndarray:
+    """Embed images off the event loop, serialized (see :func:`_embed_texts`)."""
+
+    async with lock:
+        return await asyncio.to_thread(embedder.embed_images, images)
+
+
 def _stub_preview_bytes(url: str) -> bytes:
     """Build a tiny PNG for ``stub://`` URLs (tests never hit the network)."""
 
@@ -47,6 +70,24 @@ def _stub_preview_bytes(url: str) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+def _is_decodable_image(blob: bytes) -> bool:
+    """True if PIL can actually decode the bytes as an image.
+
+    A passing ``content-type: image/*`` header is not enough: stock CDNs can
+    return HTML error pages, unsupported formats, or corrupt bodies with a 200.
+    Decoding here (where we still know which candidate the blob belongs to) lets
+    us drop just that candidate, instead of one bad preview raising deep inside
+    the batched ``embed_images`` call and failing the whole keyword item.
+    """
+
+    try:
+        with Image.open(io.BytesIO(blob)) as img:
+            img.convert("RGB")
+        return True
+    except Exception:  # noqa: BLE001 - any decode failure means "unusable preview"
+        return False
 
 
 async def _download_preview(client: httpx.AsyncClient, url: str) -> bytes | None:
@@ -72,6 +113,7 @@ async def process_item(
     credentials: dict[str, str | None],
     options: dict[str, Any],
     http_client: httpx.AsyncClient,
+    embed_lock: asyncio.Lock,
 ) -> dict[str, Any]:
     """Process a single keyword item and return a result dict (ref + assets)."""
 
@@ -83,7 +125,7 @@ async def process_item(
     limit = settings.max_assets_per_item
 
     # Embed the keyword once; reused for both the cache search and source ranking.
-    keyword_vec = embedder.embed_texts([keyword])[0]
+    keyword_vec = (await _embed_texts(embedder, embed_lock, [keyword]))[0]
 
     # Resolve the providers behind the requested source names so the cache search
     # only returns assets from sources the caller actually asked for.
@@ -115,27 +157,73 @@ async def process_item(
             return {"ref": ref, "assets": [row[1] for row in top], "error": None}
 
     # --- Otherwise search the external sources to backfill the remainder. ---
+    # Every source is an independent HTTP round trip, so fan them out and await
+    # together instead of serially. Failures stay isolated per source.
     pool: list[Candidate] = []
     source_errors: list[str] = []
-    for name in source_names:
+
+    async def _search_source(name: str) -> list[Candidate]:
         try:
             source = get_source(name)
-            if source.requires_key and name.startswith("pexels") and not credentials.get("pexels"):
-                continue
-            found = await source.search(
+            if (
+                source.requires_key
+                and source.credential_key
+                and not credentials.get(source.credential_key)
+            ):
+                return []
+            return await source.search(
                 keyword,
                 per_page,
                 credentials,
                 options,
                 http_client=http_client,
             )
-            pool.extend(found)
         except Exception as exc:  # noqa: BLE001
             logger.warning("source %s failed for ref=%s: %s", name, ref, exc)
             source_errors.append(f"{name}: {exc}")
+            return []
+
+    for found in await asyncio.gather(*[_search_source(n) for n in source_names]):
+        pool.extend(found)
 
     if pool:
-        # Download previews in parallel (bounded concurrency).
+        # First reuse exact candidate cache hits by (platform, external_id). This
+        # avoids downloading and re-embedding previews for stock items we have
+        # already seen, while still allowing every fresh keyword to rescore the
+        # cached embedding against its own text vector.
+        candidate_keys = {(c.platform, c.external_id) for c in pool}
+        cached_by_key = await asset_service.get_cached_assets_by_keys(session, candidate_keys)
+        missing_pool: list[Candidate] = []
+        seen_missing: set[tuple[str, str]] = set()
+        cache_reused = 0
+
+        for candidate in pool:
+            key = (candidate.platform, candidate.external_id)
+            cached = cached_by_key.get(key)
+            if cached is not None:
+                score = _cosine(keyword_vec, np.asarray(cached.embedding, dtype=np.float32))
+                if score >= min_score:
+                    existing = ranked_by_key.get(key)
+                    if existing is None or score > existing[0]:
+                        ranked_by_key[key] = (
+                            score,
+                            asset_service.asset_to_ranked(cached, score),
+                        )
+                cache_reused += 1
+                continue
+            if key not in seen_missing:
+                seen_missing.add(key)
+                missing_pool.append(candidate)
+
+        if cache_reused:
+            logger.info(
+                "candidate cache reused for ref=%s (%s/%s candidates, skipped download/embed)",
+                ref,
+                cache_reused,
+                len(pool),
+            )
+
+        # Download only cache misses in parallel (bounded concurrency).
         sem = asyncio.Semaphore(8)
 
         async def _fetch(candidate: Candidate) -> tuple[Candidate, bytes | None]:
@@ -143,13 +231,26 @@ async def process_item(
                 blob = await _download_preview(http_client, candidate.preview_url)
             return candidate, blob
 
-        fetched = await asyncio.gather(*[_fetch(c) for c in pool])
-        candidates_with_preview = [(c, b) for c, b in fetched if b is not None]
+        fetched = await asyncio.gather(*[_fetch(c) for c in missing_pool])
+        # Keep only previews that actually decode — a bad blob here would
+        # otherwise crash the batched embed and fail the whole item.
+        candidates_with_preview: list[tuple[Candidate, bytes]] = []
+        for candidate, blob in fetched:
+            if blob is None:
+                continue
+            if not _is_decodable_image(blob):
+                logger.debug(
+                    "preview for %s:%s did not decode as an image; skipping",
+                    candidate.platform,
+                    candidate.external_id,
+                )
+                continue
+            candidates_with_preview.append((candidate, blob))
 
         if candidates_with_preview:
             # CLIP image-embed the previews (batched), rank against the keyword.
             image_bytes = [blob for _, blob in candidates_with_preview]
-            image_embeddings = embedder.embed_images(image_bytes)
+            image_embeddings = await _embed_images(embedder, embed_lock, image_bytes)
             for (candidate, _), vec in zip(candidates_with_preview, image_embeddings, strict=True):
                 score = _cosine(keyword_vec, vec)
                 if score < min_score:
@@ -173,41 +274,50 @@ async def process_item(
 
 
 async def run_job(
-    session: AsyncSession,
+    sessionmaker: async_sessionmaker[AsyncSession],
     embedder: Embedder,
     settings: Settings,
     items: list[dict[str, Any]],
     credentials: dict[str, str | None],
     options: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Run the pipeline for every item in a job (sequential items, parallel previews inside)."""
+    """Run the pipeline for every item in a job.
+
+    Items run with bounded concurrency (``settings.item_concurrency``) so one
+    item's network I/O (source searches + preview downloads) overlaps another
+    item's CPU embedding. Each concurrent item gets its **own** DB session (an
+    ``AsyncSession`` is not safe for concurrent use), and all CLIP embedding is
+    serialized through a shared lock since there is a single CPU model. Results
+    preserve input order.
+    """
 
     headers = {"User-Agent": settings.http_user_agent}
+    embed_lock = asyncio.Lock()
+    sem = asyncio.Semaphore(max(1, settings.item_concurrency))
+
     async with httpx.AsyncClient(
         timeout=settings.http_timeout_s,
         headers=headers,
     ) as http_client:
-        results: list[dict[str, Any]] = []
-        for item in items:
-            try:
-                results.append(
-                    await process_item(
-                        session,
-                        embedder,
-                        settings,
-                        item,
-                        credentials,
-                        options,
-                        http_client,
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("item failed ref=%s", item.get("ref"))
-                results.append(
-                    {
-                        "ref": item.get("ref", "?"),
-                        "assets": [],
-                        "error": str(exc),
-                    }
-                )
-        return results
+
+        async def _run_one(item: dict[str, Any]) -> dict[str, Any]:
+            async with sem:
+                try:
+                    # Per-item session: concurrent items must not share one.
+                    async with sessionmaker() as session:
+                        return await process_item(
+                            session,
+                            embedder,
+                            settings,
+                            item,
+                            credentials,
+                            options,
+                            http_client,
+                            embed_lock,
+                        )
+                except Exception as exc:  # noqa: BLE001 - isolate one bad item
+                    logger.exception("item failed ref=%s", item.get("ref"))
+                    return {"ref": item.get("ref", "?"), "assets": [], "error": str(exc)}
+
+        # gather preserves order, so results line up with `items`.
+        return list(await asyncio.gather(*[_run_one(item) for item in items]))

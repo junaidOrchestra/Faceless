@@ -43,12 +43,21 @@ class JobCredentials(BaseModel):
     """Per-request API keys — used in memory only, never logged or persisted."""
 
     pexels: str | None = Field(default=None, description="Pexels API key.", examples=["***"])
+    pixabay: str | None = Field(default=None, description="Pixabay API key.", examples=["***"])
 
 
 class JobOptions(BaseModel):
     """Optional tuning knobs for search and ranking."""
 
     orientation: str | None = Field(default=None, description="e.g. landscape, portrait, square.")
+    quality: str | None = Field(
+        default=None,
+        description=(
+            "Media resolution tier for the downloaded asset: 'sd' (~960px), "
+            "'hd' (~1920px, default), or 'max' (largest/original available)."
+        ),
+        examples=["hd"],
+    )
     per_page: int | None = Field(default=None, ge=1, le=80, description="Results per source query.")
     min_score: float | None = Field(
         default=None,
@@ -109,11 +118,20 @@ class JobItemResult(BaseModel):
 
 
 class JobStatusResponse(BaseModel):
-    """Body for ``GET /jobs/{job_id}``."""
+    """Body for ``GET /jobs/{job_id}``.
+
+    The shape depends on status (the route uses ``response_model_exclude_none`` so
+    unset fields are omitted, keeping poll responses tiny):
+
+    * ``queued``/``running`` — only ``job_id`` + ``status`` (no payload, ever).
+    * ``failed``             — ``job_id`` + ``status`` + ``error``.
+    * ``done``               — ``job_id`` + ``status`` + ``items`` (full result,
+      returned only when ALL items are complete — never partial/mid-flight).
+    """
 
     job_id: str
     status: JobStatus
-    items: list[JobItemResult] = Field(default_factory=list)
+    items: list[JobItemResult] | None = None
     error: str | None = None
 
 

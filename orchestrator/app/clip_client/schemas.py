@@ -17,10 +17,12 @@ class ClipJobItemInput(BaseModel):
 
 class ClipJobCredentials(BaseModel):
     pexels: str | None = None
+    pixabay: str | None = None
 
 
 class ClipJobOptions(BaseModel):
     orientation: str | None = None
+    quality: str | None = None
     per_page: int | None = None
     min_score: float | None = None
 

@@ -7,9 +7,14 @@ import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile
 
 from .base import Embedder
+
+# Stock CDNs occasionally return a 200 with a valid JPEG header but a truncated
+# body. Letting PIL decode the partial data (instead of raising) keeps that
+# preview usable rather than dropping the candidate outright.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer

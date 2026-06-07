@@ -1,7 +1,61 @@
+---
+title: Faceless Video Orchestrator
+emoji: 🎬
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+app_port: 8000
+pinned: false
+---
+
 # Orchestrator — audio → faceless video
 
 Beat/video-aware service: transcribe narration, LLM keywords per beat, batch-call the
 CLIP server, build a timeline, render with FFmpeg.
+
+## Deploy to Hugging Face Spaces (Docker)
+
+This image bundles **Redis inside the container** (a Space only exposes one
+service on one port), so the worker pool's job queue just works — no sibling
+service needed. `entrypoint.sh` launches `redis-server` in the background, then
+`uvicorn` in the foreground.
+
+1. **Create a Space**: New Space → SDK **Docker** → *Blank*. The Space repo root
+   must be the contents of this `orchestrator/` folder (it needs `Dockerfile`,
+   `entrypoint.sh`, `app/`, `requirements.txt`, `migrations.sql`, and this
+   `README.md` with the YAML metadata above).
+
+2. **Run the DB migration once** against your Postgres (Neon):
+   `psql "$DATABASE_URL" -f migrations.sql`.
+
+3. **Set Space secrets** (Settings → *Variables and secrets*). At minimum:
+
+   | Secret | Notes |
+   | ------ | ----- |
+   | `DATABASE_URL` | `postgresql+psycopg://user:pw@host/db` (Neon) |
+   | `API_AUTH_SECRET` | bearer token clients must send |
+   | `CLIP_SERVER_URL` | your clip-server Space URL |
+   | `CLIP_SERVER_SECRET` | clip-server bearer token |
+   | `CEREBRAS_API_KEY` | (or the relevant `LLM_PROVIDER` key) |
+   | `STORAGE_LOCAL` | **set to `false`** — see storage note |
+   | `B2_KEY_ID` / `B2_APPLICATION_KEY` / `B2_BUCKET_NAME` | required when `STORAGE_LOCAL=false` |
+   | `WORKER_CONCURRENCY` | `1`–`2` on the free CPU tier (2 vCPU + ffmpeg) |
+
+4. **Push** the folder to the Space's git remote; HF builds the Dockerfile and
+   serves it on `app_port` (8000).
+
+> **Storage on Spaces is ephemeral.** With `STORAGE_LOCAL=true` the rendered mp4
+> is written to the container's `/tmp` and is unreachable after the request /
+> restart. For a real deployment set `STORAGE_LOCAL=false` and configure
+> Backblaze B2 so `result_url` is a durable cloud URL.
+
+> **Restarts are safe.** On boot the worker resets orphaned `running` jobs to
+> `queued` in Postgres and rebuilds the in-memory Redis queue from the database,
+> so a Space sleep/restart doesn't lose jobs.
+
+> **External Redis (optional).** To use a managed Redis (e.g. Upstash) instead of
+> the bundled one, set the `REDIS_URL` secret; it overrides the in-container
+> default.
 
 ## Endpoints
 

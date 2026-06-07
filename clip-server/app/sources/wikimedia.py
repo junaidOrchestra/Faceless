@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 import httpx
 
-from .base import Candidate, StockSource
+from .base import Candidate, StockSource, quality_target_width, resolve_quality
 from .registry import register_source
 
 logger = logging.getLogger(__name__)
@@ -62,7 +62,7 @@ class WikimediaSource(StockSource):
         *,
         http_client: httpx.AsyncClient,
     ) -> list[Candidate]:
-        del credentials, options
+        del credentials
         params = {
             "action": "query",
             "format": "json",
@@ -78,6 +78,8 @@ class WikimediaSource(StockSource):
         response.raise_for_status()
         data = response.json()
 
+        quality = resolve_quality(options)
+        target_width = quality_target_width(options)
         candidates: list[Candidate] = []
         pages = (data.get("query") or {}).get("pages") or {}
         for page in pages.values():
@@ -101,6 +103,19 @@ class WikimediaSource(StockSource):
             if not thumb or not full:
                 continue
 
+            # Commons originals are often huge (multi-MB, 4000px+). For sd/hd serve
+            # a width-scaled render via Special:FilePath; only 'max' uses the
+            # original. The preview (640px thumb) is unchanged for cheap embedding.
+            if quality == "max":
+                media_url = full
+            else:
+                filename = title.split(":", 1)[1] if ":" in title else title
+                scaled_name = quote(filename.replace(" ", "_"))
+                media_url = (
+                    f"https://commons.wikimedia.org/wiki/Special:FilePath/"
+                    f"{scaled_name}?width={target_width}"
+                )
+
             artist = (meta.get("Artist") or {}).get("value") or title
             file_page = f"https://commons.wikimedia.org/wiki/{quote(title.replace(' ', '_'))}"
 
@@ -110,7 +125,7 @@ class WikimediaSource(StockSource):
                     external_id=str(page.get("pageid")),
                     kind="photo",
                     preview_url=thumb,
-                    media_url=full,
+                    media_url=media_url,
                     attribution_name=artist,
                     attribution_url=file_page,
                     license=license_short or "See Commons file page",

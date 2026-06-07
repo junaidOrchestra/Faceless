@@ -8,6 +8,26 @@ from typing import Any, Literal
 
 MediaKind = Literal["photo", "video"]
 
+# Media resolution tiers requested via JobOptions.quality. Each source maps the
+# tier to the closest variant it offers. ``max`` means "largest/original
+# available"; ``sd``/``hd`` target roughly this pixel width so we don't download
+# 4K just to downscale it to a 1080p timeline.
+_QUALITY_TARGET_WIDTH: dict[str, int] = {"sd": 960, "hd": 1920, "max": 10**9}
+_DEFAULT_QUALITY = "hd"
+
+
+def resolve_quality(options: dict[str, Any]) -> str:
+    """Normalize ``options['quality']`` to a known tier (defaults to ``hd``)."""
+
+    quality = str(options.get("quality") or _DEFAULT_QUALITY).lower()
+    return quality if quality in _QUALITY_TARGET_WIDTH else _DEFAULT_QUALITY
+
+
+def quality_target_width(options: dict[str, Any]) -> int:
+    """Approximate target pixel width for the requested quality tier."""
+
+    return _QUALITY_TARGET_WIDTH[resolve_quality(options)]
+
 
 @dataclass(slots=True)
 class Candidate:
@@ -38,6 +58,10 @@ class StockSource(ABC):
     platform: str
     requires_key: bool
     media_kinds: tuple[MediaKind, ...]
+    # Name of the credential this source needs (looked up in the request's
+    # ``credentials`` dict), e.g. "pexels" or "pixabay". ``None`` for keyless
+    # sources like Wikimedia.
+    credential_key: str | None = None
 
     @abstractmethod
     async def search(

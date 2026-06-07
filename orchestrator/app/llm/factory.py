@@ -30,6 +30,7 @@ def build_llm(settings: Settings) -> LLMProvider:
             max_retries=settings.llm_max_retries,
             retry_backoff_s=settings.llm_retry_backoff_s,
             retry_backoff_max_s=settings.llm_retry_backoff_max_s,
+            chunk_size=settings.llm_chunk_size,
         )
     if settings.llm_provider == "local":
         if not settings.local_llm_model_path:

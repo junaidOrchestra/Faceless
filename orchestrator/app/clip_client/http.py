@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
@@ -25,17 +24,20 @@ class HttpClipClient(ClipClient):
         self._base_url = base_url.rstrip("/")
         self._secret = secret
 
-    async def submit_and_poll(
+    @property
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._secret}"}
+
+    async def submit(
         self,
         job_id: str,
         items: list[dict[str, Any]],
         credentials: dict[str, str | None],
         sources: list[str] | None,
         *,
-        poll_interval_s: float,
-        poll_timeout_s: float,
-    ) -> ClipJobStatusResponse:
-        headers = {"Authorization": f"Bearer {self._secret}"}
+        orientation: str | None = None,
+        quality: str | None = None,
+    ) -> None:
         body = ClipCreateJobRequest(
             job_id=job_id,
             items=[
@@ -46,20 +48,23 @@ class HttpClipClient(ClipClient):
                 )
                 for it in items
             ],
-            credentials=ClipJobCredentials(pexels=credentials.get("pexels")),
-            options=ClipJobOptions(min_score=0.15),
+            credentials=ClipJobCredentials(
+                pexels=credentials.get("pexels"),
+                pixabay=credentials.get("pixabay"),
+            ),
+            # orientation is forwarded to Pexels so fetched media already matches
+            # the target aspect ratio (landscape | portrait | square); quality
+            # selects the downloaded resolution tier (sd | hd | max).
+            options=ClipJobOptions(
+                min_score=0.15, orientation=orientation, quality=quality
+            ),
         )
         async with httpx.AsyncClient(base_url=self._base_url, timeout=60.0) as client:
-            create = await client.post("/jobs", json=body.model_dump(), headers=headers)
+            create = await client.post("/jobs", json=body.model_dump(), headers=self._headers)
             create.raise_for_status()
 
-            elapsed = 0.0
-            while elapsed < poll_timeout_s:
-                poll = await client.get(f"/jobs/{job_id}", headers=headers)
-                poll.raise_for_status()
-                status = ClipJobStatusResponse.model_validate(poll.json())
-                if status.status in ("done", "failed"):
-                    return status
-                await asyncio.sleep(poll_interval_s)
-                elapsed += poll_interval_s
-        raise TimeoutError(f"CLIP job {job_id} timed out after {poll_timeout_s}s")
+    async def poll(self, job_id: str) -> ClipJobStatusResponse:
+        async with httpx.AsyncClient(base_url=self._base_url, timeout=60.0) as client:
+            poll = await client.get(f"/jobs/{job_id}", headers=self._headers)
+            poll.raise_for_status()
+            return ClipJobStatusResponse.model_validate(poll.json())

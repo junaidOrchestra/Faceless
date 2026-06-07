@@ -3,14 +3,11 @@ CREATE TABLE IF NOT EXISTS video_jobs (
     user_id VARCHAR(128) NOT NULL,
     status VARCHAR(16) NOT NULL DEFAULT 'queued',
     progress VARCHAR(64),
-    clip_job_id VARCHAR(128),
     result_url TEXT,
     error TEXT,
     audio_path TEXT,
     payload JSONB,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    claimed_at TIMESTAMPTZ
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_video_jobs_status ON video_jobs (status, created_at);
@@ -30,8 +27,10 @@ CREATE TABLE IF NOT EXISTS beat_assignments (
     beat_index INTEGER NOT NULL,
     platform VARCHAR(64),
     media_url TEXT,
+    preview_url TEXT,
     kind VARCHAR(16),
     score DOUBLE PRECISION,
     attribution TEXT,
+    candidates JSONB,
     PRIMARY KEY (video_job_id, beat_index)
 );

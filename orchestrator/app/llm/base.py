@@ -16,6 +16,16 @@ class Vocabulary:
     metaphors: list[str] = field(default_factory=list)
 
 
+# Visual treatment a beat is classified into (priority order, first match wins).
+# Simplified set: every beat is a concrete stock search (broll/symbolic). No
+# planned text cards, map/data/archival special-casing, or text overlays.
+VISUAL_TYPES: tuple[str, ...] = (
+    "broll",       # concrete, filmable thing/action -> stock B-roll
+    "symbolic",    # abstract idea -> concrete stand-in stock search
+    "fallback",    # none of the above -> symbolic stock search
+)
+
+
 @dataclass(slots=True)
 class BeatQueryPlan:
     """LLM output for one beat (batched across all beats in one call)."""
@@ -24,6 +34,11 @@ class BeatQueryPlan:
     metaphor_queries: list[str] = field(default_factory=list)
     is_rhetorical: bool = False
     text_overlay: str | None = None
+    # --- Visual director classification ---------------------------------------
+    visual_type: str = "broll"
+    spec: str | None = None  # primary stock query for inspection/debug output
+    overlay: str | None = None  # kept for legacy providers; stock media should not use it
+    prefers_video: bool = False  # for B-roll: motion matters vs. quick still
 
 
 class LLMProvider(ABC):

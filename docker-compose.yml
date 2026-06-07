@@ -4,35 +4,68 @@ services:
   clip-server:
     build:
       context: ./clip-server
+    env_file:
+      - ./clip-server/.env
     environment:
-      DATABASE_URL: ${CLIP_DATABASE_URL}
-      API_AUTH_SECRET: ${CLIP_API_AUTH_SECRET}
-      ENABLED_SOURCES: '["pexels_photo"]'
-      # ENABLED_SOURCES: '["wikimedia"]'
+      ENABLED_SOURCES: '["pexels_photo","pixabay_photo","wikimedia"]'
       LOG_LEVEL: DEBUG
     ports:
       - "7860:7860"
 
+  # Local Postgres for the orchestrator (used instead of Neon for local runs).
+  db:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_USER: faceless
+      POSTGRES_PASSWORD: faceless
+      POSTGRES_DB: orchestrator
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Auto-applies the orchestrator schema on first boot.
+      - ./orchestrator/migrations.sql:/docker-entrypoint-initdb.d/01-orchestrator.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U faceless -d orchestrator"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Redis is the job dispatch queue: the API enqueues video_job ids and the
+  # orchestrator's worker pool consumes them. Postgres remains the source of
+  # truth for job state; Redis just fans work out to multiple workers.
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   orchestrator:
     build:
       context: ./orchestrator
+    # All config (incl. CLIP_SERVER_URL pointing at the deployed HF Space) lives
+    # in orchestrator/.env so secrets stay out of source control.
+    env_file:
+      - ./orchestrator/.env
     environment:
-      DATABASE_URL: ${ORCHESTRATOR_DATABASE_URL}
-      API_AUTH_SECRET: ${ORCHESTRATOR_API_AUTH_SECRET}
-      CLIP_SERVER_URL: http://clip-server:7860
-      CLIP_SERVER_SECRET: ${CLIP_API_AUTH_SECRET}
-      LLM_PROVIDER: cerebras
-      # Provide CEREBRAS_API_KEY via your shell env or a root .env file.
-      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
-      CEREBRAS_MODEL: gpt-oss-120b
-      LLM_MAX_TOKENS: "8192"
-      LLM_REASONING_EFFORT: low
-      # 0 = retry LLM timeouts indefinitely (with capped backoff).
-      LLM_MAX_RETRIES: "0"
-      ALLOWED_ORIGINS: '["http://localhost:3000"]'
-      LOG_LEVEL: INFO
+      # Point at the bundled redis service (overrides any localhost default).
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
+    # The rendered mp4 lands at /tmp/faceless-render/<job_id>/<job_id>.mp4 inside
+    # the container; this mount exposes it on the host under ./orchestrator-output.
+    volumes:
+      - ./orchestrator-output:/tmp/faceless-render
     depends_on:
-      clip-server:
-        condition: service_started
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:

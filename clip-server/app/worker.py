@@ -57,8 +57,11 @@ class JobWorker:
                     credentials = payload.get("credentials") or {}
                     options = payload.get("options") or {}
                     try:
+                        # run_job opens its own per-item sessions for concurrent
+                        # processing; the claim/mark session here stays dedicated
+                        # to job-row bookkeeping.
                         results = await run_job(
-                            session,
+                            sessionmaker,
                             self._embedder,
                             self._settings,
                             items,

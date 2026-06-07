@@ -14,8 +14,11 @@ class StubRenderer(Renderer):
         audio_path: str,
         timeline: list[TimelineBeat],
         output_path: str,
+        *,
+        width: int = 1280,
+        height: int = 720,
     ) -> str:
-        del audio_path, timeline
+        del audio_path, timeline, width, height
 
         def _write() -> str:
             path = Path(output_path)

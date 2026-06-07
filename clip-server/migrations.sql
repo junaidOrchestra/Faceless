@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS assets (
     embedding vector(512) NOT NULL,
     keyword VARCHAR(256),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (platform, external_id)
+    CONSTRAINT uq_assets_platform_external UNIQUE (platform, external_id)
 );
 
 -- Cache-first similarity search: ANN over already-embedded assets, cosine to

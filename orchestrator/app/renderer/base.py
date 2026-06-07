@@ -13,7 +13,7 @@ class TimelineBeat:
     end_s: float
     kind: str  # photo | video | text
     media_url: str | None
-    text_overlay: str | None = None
+    text_overlay: str | None = None  # text card body, or optional stock overlay
     is_rhetorical: bool = False
 
 
@@ -24,5 +24,8 @@ class Renderer(ABC):
         audio_path: str,
         timeline: list[TimelineBeat],
         output_path: str,
+        *,
+        width: int = 1280,
+        height: int = 720,
     ) -> str:
-        """Render the final MP4 and return the output path."""
+        """Render the final MP4 at ``width``x``height`` and return the output path."""
