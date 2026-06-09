@@ -138,10 +138,16 @@ async def create_job(
 ) -> CreateJobResponse:
     _validate_create_job(body, settings)
     items_payload = [item.model_dump() for item in body.items]
+    # Source API keys come from THIS service's environment, not the request: the
+    # orchestrator no longer sends keys over the wire. Any key the caller does
+    # send still wins (back-compat), but normally these env fallbacks supply
+    # them. The per-source guard only runs a key-requiring source when its
+    # credential is present in this dict.
     credentials = body.credentials.model_dump()
-    # Fall back to the process-wide Flickr key so editorial routing works even
-    # when the caller doesn't pass one per request. The per-source guard only
-    # runs a key-requiring source when its credential is present in this dict.
+    if not credentials.get("pexels") and settings.pexels_api_key:
+        credentials["pexels"] = settings.pexels_api_key
+    if not credentials.get("pixabay") and settings.pixabay_api_key:
+        credentials["pixabay"] = settings.pixabay_api_key
     if not credentials.get("flickr") and settings.flickr_api_key:
         credentials["flickr"] = settings.flickr_api_key
     try:

@@ -133,7 +133,17 @@ function mergeJob(prev: VideoJob | null, incoming: VideoJob): VideoJob {
     quality: prev.quality,
     captions: prev.captions,
     music: prev.music,
-    theme: prev.theme ?? incoming.theme,
+    // Theme stickiness. A vibe is ONLY ever produced by an explicit user choice
+    // — the server never invents one and reports the default {mode:"script"}
+    // until /prepare persists the pick. There's a window right after the user
+    // commits where in-flight polls still carry that stale "script" default; if
+    // we trusted it we'd clobber the chosen vibe (e.g. on the pick-clips screen,
+    // where awaitingSetup is already false). So never let a non-vibe reading
+    // overwrite a locally-chosen vibe; otherwise take the incoming theme.
+    theme:
+      prev.theme?.mode === "vibe" && incoming.theme?.mode !== "vibe"
+        ? prev.theme
+        : incoming.theme ?? prev.theme,
     // Once the user commits output choices we own these flags locally so a
     // mid-flight poll (server still at "transcribed") can't bounce us back.
     prepared: prev.prepared || incoming.prepared,

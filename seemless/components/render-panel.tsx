@@ -9,6 +9,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { ThemeBadge } from "@/components/theme-badge";
 import type { VideoJob } from "@/lib/types";
 import { findChosenAsset, jobPhase } from "@/lib/store";
 import { fmtTime } from "@/lib/utils";
@@ -79,6 +80,9 @@ export function RenderPanel({
           <p className="mt-1 font-mono text-[11px] text-faint">
             {job.aspect} · {fmtTime(job.durationSec ?? 0)} · {job.beats.length} beats
           </p>
+          <div className="mt-2 flex justify-center">
+            <ThemeBadge theme={job.theme} />
+          </div>
           <div className="relative mx-auto mt-4 aspect-[9/16] w-28 overflow-hidden rounded-xl border border-hairline bg-canvas">
             {showPosterVideoFrame ? (
               <video
@@ -125,6 +129,9 @@ export function RenderPanel({
           <p className="mt-2 font-mono text-[11px] text-faint/80">
             {job.stage === "render_queued" ? "Queued for rendering" : "Rendering"} · {job.percent}%
           </p>
+          <div className="mt-3 flex justify-center">
+            <ThemeBadge theme={job.theme} />
+          </div>
           <p className="mt-3 text-[11px] text-faint/60">
             {job.slow
               ? "This is taking longer than usual, but it's still running. You can safely leave or refresh — we'll pick up where it left off."

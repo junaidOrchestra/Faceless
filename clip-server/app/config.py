@@ -34,6 +34,26 @@ class Settings(BaseSettings):
     )
     log_level: str = Field(default="INFO", description="Root log level.")
 
+    # --- Result publishing (shared cloud Redis) ------------------------------
+    # The clip-server publishes finished job results onto a shared Redis queue
+    # that the orchestrator consumes (instead of being HTTP-polled). Point this
+    # at the SAME cloud Redis the orchestrator uses.
+    redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        description="Shared cloud Redis URL used to publish finished clip results.",
+    )
+    publish_results: bool = Field(
+        default=True,
+        description="Publish each finished job's result to Redis for the orchestrator.",
+    )
+    clip_result_queue: str = Field(
+        default="clip_result",
+        description=(
+            "Base name of the Redis queue results are published onto. MUST match "
+            "the orchestrator's CLIP_RESULT_QUEUE. Messages go to '<name>:queue'."
+        ),
+    )
+
     # --- Database connection pool --------------------------------------------
     # Bound the pool so item_concurrency (each item opens its own session) plus
     # the worker bookkeeping, sweeper, heartbeat, and API poll sessions can never
@@ -100,10 +120,15 @@ class Settings(BaseSettings):
         default_factory=lambda: ["wikimedia"],
         description="Default stock sources; can be overridden per request/item.",
     )
-    # Optional process-wide Flickr key. The orchestrator may also send a Flickr
-    # key per request (credentials.flickr); when it doesn't, the Flickr source
-    # falls back to this env value so editorial routing works without the
-    # frontend having to supply a key.
+    # Process-wide source API keys. The orchestrator NO LONGER sends keys per
+    # request — the clip-server reads them from its own environment here. Each
+    # source only runs when its key is present.
+    pexels_api_key: str | None = Field(
+        default=None, description="Pexels API key (PEXELS_API_KEY)."
+    )
+    pixabay_api_key: str | None = Field(
+        default=None, description="Pixabay API key (PIXABAY_API_KEY)."
+    )
     flickr_api_key: str | None = Field(
         default=None, description="Fallback Flickr API key (FLICKR_API_KEY)."
     )

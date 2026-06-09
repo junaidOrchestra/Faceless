@@ -31,7 +31,7 @@ from . import storage
 from . import vibe_pipeline
 from . import vibes as vibe_registry
 from .clip_client.base import ClipClient
-from .clip_client.schemas import ClipRankedAsset
+from .clip_client.schemas import ClipJobStatusResponse, ClipRankedAsset
 from .config import Settings
 from .formats import search_orientation
 from .llm.base import LLMProvider, Vocabulary
@@ -354,19 +354,44 @@ async def poll_clip_job(
     *,
     clip_client: ClipClient,
 ) -> str:
-    """Poll the CLIP job once.
+    """Poll the CLIP job once (HTTP fallback path, e.g. stub/local).
 
     Returns ``"pending"`` (still searching), ``"failed"`` (marked failed), or
     ``"ready"`` (assignments written, job ready to render).
+
+    In production the orchestrator does NOT poll: the clip-server publishes its
+    finished result to Redis and :func:`apply_clip_result` is invoked by the
+    clip-result consumer. This function remains for the stub client and local
+    runs that don't share a Redis result queue.
     """
 
     status = await clip_client.poll(f"{job_id}-clip")
+    if status.status not in ("done", "failed"):
+        # queued / running / processing — still searching.
+        return "pending"
+    return await apply_clip_result(session, settings, job_id, payload, status)
+
+
+async def apply_clip_result(
+    session: AsyncSession,
+    settings: Settings,
+    job_id: str,
+    payload: dict[str, Any],
+    status: ClipJobStatusResponse,
+) -> str:
+    """Transform a terminal clip-search result into durable editor state.
+
+    ``status`` must be a finished :class:`ClipJobStatusResponse` (``done`` or
+    ``failed``). Persists beats + assignments + candidates, then advances the job
+    to ``ready`` — or marks it ``failed``. Shared by both the HTTP poller and the
+    Redis clip-result consumer so the transform logic lives in one place.
+
+    Returns ``"failed"`` or ``"ready"``.
+    """
+
     if status.status == "failed":
         await job_service.mark_failed(session, job_id, status.error or "CLIP job failed")
         return "failed"
-    if status.status != "done":
-        # queued / running / processing — still searching.
-        return "pending"
 
     # Vibe mode: hand the finished (unranked) pool to the separate vibe pipeline,
     # which tiles the clips by duration into beats. Keeps the script assembly

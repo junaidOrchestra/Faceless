@@ -120,6 +120,10 @@ class VideoStatusResponse(BaseModel):
     progress: str | None = None
     result_url: str | None = None
     error: str | None = None
+    # The content theme chosen for this job (match the script, or a vibe). Read
+    # from the job payload so the editor's pick-clips/render screens can show
+    # which theme is in effect. Defaults to script when unset.
+    theme: ThemeChoice | None = None
 
 
 class BeatAssignmentOut(BaseModel):

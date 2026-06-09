@@ -9,6 +9,7 @@ from .config import Settings
 from .db import get_sessionmaker
 from .embedding.base import Embedder
 from .pipeline import run_job
+from .queue import publish_clip_result
 from .services import jobs as job_service
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,12 @@ class JobWorker:
                         len(result.requeued),
                         len(result.failed),
                     )
+                # Tell the orchestrator about jobs the sweeper gave up on so it can
+                # fail the video immediately instead of waiting out its backstop.
+                for job_id in result.failed:
+                    await publish_clip_result(
+                        job_id, "failed", error="clip worker heartbeat stale; gave up"
+                    )
             except Exception:  # noqa: BLE001
                 logger.exception("stale clip job sweeper error")
             await asyncio.sleep(self._settings.job_stale_sweep_interval_s)
@@ -131,20 +138,22 @@ class JobWorker:
                             timeout=self._settings.job_deadline_s,
                         )
                         await job_service.mark_job_done(session, job.job_id, results)
+                        await publish_clip_result(
+                            job.job_id, "done", items=results
+                        )
                     except (asyncio.TimeoutError, TimeoutError):
                         logger.error(
                             "job %s exceeded deadline %ss",
                             job.job_id,
                             self._settings.job_deadline_s,
                         )
-                        await job_service.mark_job_failed(
-                            session,
-                            job.job_id,
-                            f"job exceeded {self._settings.job_deadline_s:.0f}s deadline",
-                        )
+                        error = f"job exceeded {self._settings.job_deadline_s:.0f}s deadline"
+                        await job_service.mark_job_failed(session, job.job_id, error)
+                        await publish_clip_result(job.job_id, "failed", error=error)
                     except Exception as exc:  # noqa: BLE001
                         logger.exception("job %s failed", job.job_id)
                         await job_service.mark_job_failed(session, job.job_id, str(exc))
+                        await publish_clip_result(job.job_id, "failed", error=str(exc))
                     finally:
                         await self._cancel_heartbeat(heartbeat)
             except Exception:  # noqa: BLE001

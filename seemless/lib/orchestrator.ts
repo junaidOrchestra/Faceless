@@ -8,6 +8,7 @@ import type {
   VideoJob,
   VisualType,
 } from "./types";
+import type { VibeId } from "./vibes";
 import { getPreviewAudioUrl } from "./preview-audio";
 
 // Flip to true once the orchestrator exposes GET /videos/{id}/audio (so the
@@ -57,6 +58,7 @@ type OrchStatus =
   | "rendering"
   | "done"
   | "failed";
+type OrchTheme = { mode?: string | null; vibe?: string | null } | null;
 
 // --- Mappers ----------------------------------------------------------------
 
@@ -132,6 +134,13 @@ const RUNNING_STATUSES: OrchStatus[] = [
   "render_queued",
   "rendering",
 ];
+
+function mapTheme(t?: OrchTheme): ContentTheme {
+  if (t && t.mode === "vibe" && t.vibe) {
+    return { mode: "vibe", vibe: t.vibe as VibeId };
+  }
+  return { mode: "script" };
+}
 
 function mapStatus(s: OrchStatus): VideoJob["status"] {
   if (s === "done") return "done";
@@ -220,7 +229,7 @@ export async function orchGetVideoJob(id: string): Promise<VideoJob> {
     quality: "standard",
     captions: true,
     music: false,
-    theme: { mode: "script" },
+    theme: mapTheme(status.theme as OrchTheme),
     // The whole window before the clip search starts. Output choices can be
     // committed any time here (POST /prepare) — even while transcription is
     // still running — so the setup form is offered immediately on upload.

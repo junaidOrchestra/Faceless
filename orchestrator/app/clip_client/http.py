@@ -40,6 +40,11 @@ class HttpClipClient(ClipClient):
         rank: bool = True,
         per_page: int | None = None,
     ) -> None:
+        # Source API keys (Pexels/Pixabay/Flickr) are intentionally NOT sent in
+        # the request: the clip-server reads them from its own environment. We
+        # keep accepting ``credentials`` on the interface for back-compat, but
+        # drop them here so keys never travel over the wire.
+        del credentials
         body = ClipCreateJobRequest(
             job_id=job_id,
             items=[
@@ -50,11 +55,7 @@ class HttpClipClient(ClipClient):
                 )
                 for it in items
             ],
-            credentials=ClipJobCredentials(
-                pexels=credentials.get("pexels"),
-                pixabay=credentials.get("pixabay"),
-                flickr=credentials.get("flickr"),
-            ),
+            credentials=ClipJobCredentials(),
             # orientation is forwarded to Pexels so fetched media already matches
             # the target aspect ratio (landscape | portrait | square); quality
             # selects the downloaded resolution tier (sd | hd | max). rank=False

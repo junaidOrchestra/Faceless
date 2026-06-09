@@ -13,6 +13,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
+import { ThemeBadge } from "@/components/theme-badge";
 import { PreviewPlayer } from "@/components/preview-player";
 import type { Aspect, VideoJob } from "@/lib/types";
 import { ASPECTS, findChosenAsset, QUALITIES, useEditorStore } from "@/lib/store";
@@ -118,6 +119,16 @@ export function Sidebar({
     <aside className="space-y-4 lg:sticky lg:top-[136px]">
       <div className="panel p-4">
         <PreviewFrame job={job} />
+      </div>
+
+      <div className="panel space-y-2 p-4">
+        <h3 className="font-heading text-sm font-semibold text-cream">Content theme</h3>
+        <ThemeBadge theme={job.theme} />
+        <p className="text-xs text-faint">
+          {job.theme.mode === "vibe"
+            ? "Clips come from this vibe, not your narration."
+            : "Clips are matched to what your narration says."}
+        </p>
       </div>
 
       <div className="panel space-y-4 p-4">

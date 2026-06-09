@@ -483,6 +483,7 @@ async def get_video(
         # locally in dev).
         result_url=None,
         error=job.error,
+        theme=(job.payload or {}).get("theme"),
     )
 
 

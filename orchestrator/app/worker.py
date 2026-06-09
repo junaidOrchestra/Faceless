@@ -8,9 +8,11 @@ into independent stages, each with its own worker pool fed by a Redis queue:
 * **llm** pool — ``llm:queue`` -> :func:`pipeline.stage_llm` (LLM + submit CLIP
   job), then move the job to ``awaiting_clip`` (or ``ready`` if nothing to
   search).
-* **clip poller** (single task) — periodically scans ``awaiting_clip`` jobs and
-  polls the clip-server once each; on completion writes assignments and moves the
-  job to ``ready``. A blocked clip job no longer ties up a worker slot.
+* **clip result consumer** (single task) — consumes finished clip-search results
+  the clip-server publishes to the shared Redis ``clip_result`` queue, transforms
+  each into durable editor state, and moves the job to ``ready``. (The in-process
+  stub has no Redis publisher, so stub/local runs fall back to a **clip poller**
+  that HTTP-polls the clip-server instead.)
 * **render** pool — ``render:queue`` -> :func:`pipeline.stage_render`. Rendering
   is *not* automatic; the API enqueues a render request for a ``ready`` job.
 
@@ -21,6 +23,7 @@ reset to their pending status and the Redis queues are rebuilt from the DB.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -28,6 +31,8 @@ from datetime import datetime, timezone
 from . import pipeline
 from . import queue as job_queue
 from .clip_client.base import ClipClient
+from .clip_client.schemas import ClipJobStatusResponse
+from .clip_client.stub import StubClipClient
 from .config import Settings
 from .db import get_sessionmaker, safe_db_target
 from .llm.base import LLMProvider
@@ -97,13 +102,25 @@ class PipelineWorkers:
                     name=f"render-{n}",
                 )
             )
-        self._tasks.append(asyncio.create_task(self._clip_poller(), name="clip-poller"))
+        # Clip-search result handling. With the real clip-server, results arrive
+        # via the shared Redis result queue (the clip-server publishes; we
+        # consume). The in-process stub has no Redis publisher, so fall back to
+        # HTTP polling for local/stub runs and tests.
+        if isinstance(self._clip_client, StubClipClient):
+            self._tasks.append(asyncio.create_task(self._clip_poller(), name="clip-poller"))
+            clip_mode = "clip poller (stub)"
+        else:
+            self._tasks.append(
+                asyncio.create_task(self._clip_result_consumer(), name="clip-result-consumer")
+            )
+            clip_mode = "clip result consumer"
         self._tasks.append(asyncio.create_task(self._stale_job_sweeper(), name="stale-job-sweeper"))
         logger.info(
-            "started pipeline workers (transcribe=%s llm=%s render=%s + clip poller + stale sweeper)",
+            "started pipeline workers (transcribe=%s llm=%s render=%s + %s + stale sweeper)",
             max(1, s.transcribe_concurrency),
             max(1, s.llm_concurrency),
             max(1, s.render_concurrency),
+            clip_mode,
         )
 
     async def stop(self) -> None:
@@ -127,6 +144,10 @@ class PipelineWorkers:
             await job_queue.transcribe_queue.rebuild(transcribe_ids)
             await job_queue.llm_queue.rebuild(llm_ids)
             await job_queue.render_queue.rebuild(render_ids)
+            # The clip-result queue's pending set can't be rebuilt from our DB
+            # (messages originate in the clip-server). Re-deliver anything a prior
+            # process claimed but didn't ack instead of dropping it.
+            await job_queue.clip_result_queue.requeue_processing()
         except Exception:  # noqa: BLE001 - never block startup on reconcile
             logger.exception(
                 "failed to reconcile job queues on startup (db=%s)", safe_db_target()
@@ -489,6 +510,92 @@ class PipelineWorkers:
             self._clip_started.pop(job_id, None)
         elif outcome == "pending":
             age = _age_seconds(created_at)
+            if age is not None and age > self._settings.clip_poll_max_age_s:
+                self._clip_started.pop(job_id, None)
+                async with sessionmaker() as fail_session:
+                    await job_service.mark_failed(
+                        fail_session, job_id, f"CLIP search timed out after {age:.0f}s"
+                    )
+
+    # -- clip result consumer (Redis push from clip-server) --------------------
+
+    async def _clip_result_consumer(self) -> None:
+        """Consume finished clip-search results the clip-server publishes to Redis.
+
+        Each message is a terminal :class:`ClipJobStatusResponse` envelope keyed
+        by the clip job id (``<video_job_id>-clip``). We transform it into durable
+        editor state via :func:`pipeline.apply_clip_result` and mark the job ready
+        (or failed) — the same work the HTTP poller did, now event-driven.
+        """
+
+        sessionmaker = get_sessionmaker()
+        queue = job_queue.clip_result_queue
+        last_backstop = time.monotonic()
+        while not self._stop.is_set():
+            try:
+                raw = await queue.claim(self._settings.worker_poll_interval_s)
+                if raw is not None:
+                    try:
+                        await self._handle_clip_result(sessionmaker, raw)
+                    finally:
+                        await queue.ack(raw)
+                # A published result may never arrive (clip-server crash, Redis
+                # flush). Periodically fail awaiting_clip jobs older than the cap
+                # so they don't hang forever.
+                now = time.monotonic()
+                if now - last_backstop >= self._settings.clip_poll_scan_interval_s:
+                    last_backstop = now
+                    await self._clip_age_backstop(sessionmaker)
+            except Exception:  # noqa: BLE001
+                logger.exception("clip result consumer error (db=%s)", safe_db_target())
+                await asyncio.sleep(self._settings.worker_poll_interval_s)
+
+    async def _handle_clip_result(self, sessionmaker, raw: str) -> None:
+        try:
+            msg = json.loads(raw)
+            status = ClipJobStatusResponse.model_validate(msg)
+        except Exception:  # noqa: BLE001 - a malformed message must not wedge the queue
+            logger.exception("dropping malformed clip result message")
+            return
+
+        clip_job_id = status.job_id or ""
+        video_job_id = (
+            clip_job_id[: -len("-clip")] if clip_job_id.endswith("-clip") else clip_job_id
+        )
+
+        async with sessionmaker() as session:
+            job = await job_service.get_video_job(session, video_job_id)
+            if job is None or job.status != "awaiting_clip":
+                logger.info(
+                    "ignoring clip result for %s (status=%s)",
+                    video_job_id,
+                    None if job is None else job.status,
+                )
+                return
+            payload = job.payload or {}
+            try:
+                outcome = await pipeline.apply_clip_result(
+                    session, self._settings, video_job_id, payload, status
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("clip result apply error for %s", video_job_id)
+                try:
+                    await session.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+                async with sessionmaker() as fail_session:
+                    await job_service.mark_failed(fail_session, video_job_id, str(exc))
+                return
+
+        logger.info("clip result for job %s applied -> %s", video_job_id, outcome)
+
+    async def _clip_age_backstop(self, sessionmaker) -> None:
+        async with sessionmaker() as session:
+            jobs = await job_service.list_awaiting_clip_jobs(session)
+            stale = [(j.id, _age_seconds(j.created_at)) for j in jobs]
+        for job_id, age in stale:
+            if self._stop.is_set():
+                break
             if age is not None and age > self._settings.clip_poll_max_age_s:
                 self._clip_started.pop(job_id, None)
                 async with sessionmaker() as fail_session:

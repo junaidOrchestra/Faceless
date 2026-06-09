@@ -150,6 +150,14 @@ class Settings(BaseSettings):
         default="redis://localhost:6379/0",
         description="Redis URL used as the video-job dispatch queue.",
     )
+    # Base name of the cross-service queue the clip-server publishes finished
+    # clip-search results onto (the orchestrator consumes from it instead of
+    # HTTP-polling). MUST match the clip-server's CLIP_RESULT_QUEUE. The actual
+    # Redis keys are "<name>:queue" and "<name>:processing".
+    clip_result_queue: str = Field(
+        default="clip_result",
+        description="Base name of the Redis queue carrying clip-search results back from the clip-server.",
+    )
     # Per-stage worker pool sizes. The pipeline is split into independent stages
     # (transcribe -> llm -> clip poll -> render) each fed by its own Redis queue,
     # so they scale separately. Keep modest on a small box (each render runs
