@@ -29,9 +29,11 @@ from . import pipeline
 from . import queue as job_queue
 from .clip_client.base import ClipClient
 from .config import Settings
-from .db import get_sessionmaker
+from .db import get_sessionmaker, safe_db_target
 from .llm.base import LLMProvider
 from .renderer.base import Renderer
+from .services import credits as credit_service
+from .services import projects as project_service
 from .services import video_jobs as job_service
 from .transcriber.base import Transcriber
 
@@ -96,8 +98,9 @@ class PipelineWorkers:
                 )
             )
         self._tasks.append(asyncio.create_task(self._clip_poller(), name="clip-poller"))
+        self._tasks.append(asyncio.create_task(self._stale_job_sweeper(), name="stale-job-sweeper"))
         logger.info(
-            "started pipeline workers (transcribe=%s llm=%s render=%s + 1 clip poller)",
+            "started pipeline workers (transcribe=%s llm=%s render=%s + clip poller + stale sweeper)",
             max(1, s.transcribe_concurrency),
             max(1, s.llm_concurrency),
             max(1, s.render_concurrency),
@@ -125,7 +128,9 @@ class PipelineWorkers:
             await job_queue.llm_queue.rebuild(llm_ids)
             await job_queue.render_queue.rebuild(render_ids)
         except Exception:  # noqa: BLE001 - never block startup on reconcile
-            logger.exception("failed to reconcile job queues on startup")
+            logger.exception(
+                "failed to reconcile job queues on startup (db=%s)", safe_db_target()
+            )
 
     # -- generic stage consumer ------------------------------------------------
 
@@ -147,7 +152,12 @@ class PipelineWorkers:
     async def _fail(
         self, sessionmaker, session, job_id: str, stage: str, exc: BaseException
     ) -> None:
-        """Mark a job failed on a FRESH session (the failing op may have tainted it)."""
+        """Mark a job failed on a FRESH session (the failing op may have tainted it).
+
+        For a failed *render* this also refunds any credits charged at render
+        time (idempotent) and marks the linked project failed, so a user is never
+        billed for a video that didn't ship.
+        """
 
         logger.exception("job %s failed in %s stage", job_id, stage)
         try:
@@ -156,6 +166,102 @@ class PipelineWorkers:
             pass
         async with sessionmaker() as fail_session:
             await job_service.mark_failed(fail_session, job_id, str(exc))
+        if stage == "render":
+            async with sessionmaker() as refund_session:
+                await self._refund_render(refund_session, job_id)
+
+    async def _refund_render(self, session, job_id: str) -> None:
+        """Refund render credits and fail the project for a failed render (idempotent)."""
+
+        job = await job_service.get_video_job(session, job_id)
+        if job is None:
+            return
+        payload = job.payload or {}
+        amount = int(payload.get("credits_charged") or 0)
+        user_id = payload.get("charge_user_id")
+        project_id = payload.get("project_id") or job.project_id
+
+        if amount > 0 and user_id and not payload.get("refunded"):
+            try:
+                refunded = await credit_service.refund_credits(
+                    session, user_id, amount, project_id=project_id or job_id
+                )
+                if refunded:
+                    new_payload = dict(payload)
+                    new_payload["refunded"] = True
+                    await job_service.update_payload(session, job_id, new_payload)
+                    logger.info(
+                        "refunded %s credit(s) to %s after failed render of %s",
+                        amount,
+                        user_id,
+                        job_id,
+                    )
+            except Exception:  # noqa: BLE001 - never let a refund failure mask the job failure
+                logger.exception("failed to refund credits for job %s", job_id)
+
+        if project_id:
+            try:
+                await project_service.update_project(session, project_id, status="failed")
+            except Exception:  # noqa: BLE001
+                logger.warning("could not mark project %s failed", project_id, exc_info=True)
+
+    async def _heartbeat_job(self, sessionmaker, job_id: str, active_status: str) -> None:
+        """Refresh an active job heartbeat until the stage finishes."""
+
+        while not self._stop.is_set():
+            await asyncio.sleep(self._settings.job_heartbeat_interval_s)
+            try:
+                async with sessionmaker() as session:
+                    refreshed = await job_service.heartbeat_job(session, job_id, active_status)
+                if not refreshed:
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - heartbeat failure should not kill the stage
+                logger.warning("heartbeat failed for job %s (%s)", job_id, active_status, exc_info=True)
+
+    async def _cancel_heartbeat(self, task: asyncio.Task[None]) -> None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _enqueue_recovered_jobs(self, requeued: dict[str, list[str]]) -> None:
+        for status, job_ids in requeued.items():
+            queue = {
+                "queued": job_queue.transcribe_queue,
+                "transcribed": job_queue.llm_queue,
+                "render_queued": job_queue.render_queue,
+            }.get(status)
+            if queue is None:
+                continue
+            for job_id in job_ids:
+                await queue.enqueue(job_id)
+
+    async def _stale_job_sweeper(self) -> None:
+        """Periodically recover active jobs whose worker heartbeat stopped."""
+
+        sessionmaker = get_sessionmaker()
+        while not self._stop.is_set():
+            try:
+                async with sessionmaker() as session:
+                    result = await job_service.sweep_stale_active_jobs(
+                        session,
+                        stale_timeout_s=self._settings.job_stale_timeout_s,
+                        max_attempts=self._settings.job_max_attempts,
+                    )
+                await self._enqueue_recovered_jobs(result.requeued)
+                recovered = {k: len(v) for k, v in result.requeued.items() if v}
+                if recovered or result.failed:
+                    logger.warning(
+                        "stale job sweep recovered=%s failed=%s",
+                        recovered,
+                        len(result.failed),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception("stale job sweeper error (db=%s)", safe_db_target())
+            await asyncio.sleep(self._settings.job_stale_sweep_interval_s)
 
     # -- stage handlers --------------------------------------------------------
 
@@ -171,14 +277,21 @@ class PipelineWorkers:
                 return
             logger.info("transcribe worker %s processing job %s", worker_id, job_id)
             started = time.monotonic()
+            heartbeat = asyncio.create_task(
+                self._heartbeat_job(sessionmaker, job_id, "transcribing"),
+                name=f"heartbeat-transcribing-{job_id}",
+            )
             try:
-                await pipeline.stage_transcribe(
-                    session,
-                    self._settings,
-                    job_id,
-                    job.audio_path,
-                    job.payload or {},
-                    transcriber=self._transcriber,
+                await asyncio.wait_for(
+                    pipeline.stage_transcribe(
+                        session,
+                        self._settings,
+                        job_id,
+                        job.audio_path,
+                        job.payload or {},
+                        transcriber=self._transcriber,
+                    ),
+                    timeout=self._settings.transcribe_timeout_s,
                 )
                 logger.info(
                     "stage transcribe for job %s finished in %.2fs",
@@ -186,12 +299,46 @@ class PipelineWorkers:
                     time.monotonic() - started,
                 )
                 await job_service.advance(session, job_id, "transcribed")
-                await job_queue.llm_queue.enqueue(job_id)
+                # Gate: only continue into the LLM + clip-search stage once the
+                # caller has committed the output shape (format/quality). A job
+                # submitted without a format pauses here until POST /prepare sets
+                # ``prepared`` (re-read fresh: /prepare may have just set it while
+                # we were transcribing).
+                await session.refresh(job)
+                if (job.payload or {}).get("prepared"):
+                    await job_queue.llm_queue.enqueue(job_id)
+                else:
+                    logger.info(
+                        "job %s transcribed; awaiting /prepare before clip search", job_id
+                    )
+            except (asyncio.TimeoutError, TimeoutError):
+                await self._fail(
+                    sessionmaker,
+                    session,
+                    job_id,
+                    "transcribe",
+                    TimeoutError(
+                        f"Transcription exceeded {self._settings.transcribe_timeout_s:.0f}s"
+                    ),
+                )
             except Exception as exc:  # noqa: BLE001
                 await self._fail(sessionmaker, session, job_id, "transcribe", exc)
+            finally:
+                await self._cancel_heartbeat(heartbeat)
 
     async def _handle_llm(self, sessionmaker, job_id: str, worker_id: int) -> None:
         async with sessionmaker() as session:
+            # Guard: a transcribed job may land on the llm queue via startup
+            # reconcile before it has been prepared. Skip it (a later /prepare
+            # re-enqueues) so the output-shape gate is never bypassed.
+            existing = await job_service.get_video_job(session, job_id)
+            if existing is None:
+                return
+            if existing.status == "transcribed" and not (existing.payload or {}).get(
+                "prepared"
+            ):
+                logger.info("job %s on llm queue but not prepared; skipping", job_id)
+                return
             job = await job_service.claim_for_stage(
                 session, job_id, from_statuses=("transcribed", "llm"), to_status="llm"
             )
@@ -199,14 +346,21 @@ class PipelineWorkers:
                 return
             logger.info("llm worker %s processing job %s", worker_id, job_id)
             started = time.monotonic()
+            heartbeat = asyncio.create_task(
+                self._heartbeat_job(sessionmaker, job_id, "llm"),
+                name=f"heartbeat-llm-{job_id}",
+            )
             try:
-                submitted = await pipeline.stage_llm(
-                    session,
-                    self._settings,
-                    job_id,
-                    job.payload or {},
-                    llm=self._llm,
-                    clip_client=self._clip_client,
+                submitted = await asyncio.wait_for(
+                    pipeline.stage_llm(
+                        session,
+                        self._settings,
+                        job_id,
+                        job.payload or {},
+                        llm=self._llm,
+                        clip_client=self._clip_client,
+                    ),
+                    timeout=self._settings.llm_stage_timeout_s,
                 )
                 logger.info(
                     "stage llm for job %s finished in %.2fs",
@@ -218,8 +372,20 @@ class PipelineWorkers:
                     await job_service.advance(session, job_id, "awaiting_clip")
                 else:
                     await job_service.advance(session, job_id, "ready", progress="ready")
+            except (asyncio.TimeoutError, TimeoutError):
+                await self._fail(
+                    sessionmaker,
+                    session,
+                    job_id,
+                    "llm",
+                    TimeoutError(
+                        f"LLM stage exceeded {self._settings.llm_stage_timeout_s:.0f}s"
+                    ),
+                )
             except Exception as exc:  # noqa: BLE001
                 await self._fail(sessionmaker, session, job_id, "llm", exc)
+            finally:
+                await self._cancel_heartbeat(heartbeat)
 
     async def _handle_render(self, sessionmaker, job_id: str, worker_id: int) -> None:
         async with sessionmaker() as session:
@@ -233,14 +399,21 @@ class PipelineWorkers:
                 return
             logger.info("render worker %s processing job %s", worker_id, job_id)
             started = time.monotonic()
+            heartbeat = asyncio.create_task(
+                self._heartbeat_job(sessionmaker, job_id, "rendering"),
+                name=f"heartbeat-rendering-{job_id}",
+            )
             try:
-                result_url = await pipeline.stage_render(
-                    session,
-                    self._settings,
-                    job_id,
-                    job.audio_path,
-                    job.payload or {},
-                    renderer=self._renderer,
+                result_url = await asyncio.wait_for(
+                    pipeline.stage_render(
+                        session,
+                        self._settings,
+                        job_id,
+                        job.audio_path,
+                        job.payload or {},
+                        renderer=self._renderer,
+                    ),
+                    timeout=self._settings.render_stage_timeout_s,
                 )
                 logger.info(
                     "stage render for job %s finished in %.2fs",
@@ -248,8 +421,28 @@ class PipelineWorkers:
                     time.monotonic() - started,
                 )
                 await job_service.mark_done(session, job_id, result_url)
+                if job.project_id:
+                    async with sessionmaker() as proj_session:
+                        await project_service.update_project(
+                            proj_session,
+                            job.project_id,
+                            status="done",
+                            result_url=result_url,
+                        )
+            except (asyncio.TimeoutError, TimeoutError):
+                await self._fail(
+                    sessionmaker,
+                    session,
+                    job_id,
+                    "render",
+                    TimeoutError(
+                        f"Render stage exceeded {self._settings.render_stage_timeout_s:.0f}s"
+                    ),
+                )
             except Exception as exc:  # noqa: BLE001
                 await self._fail(sessionmaker, session, job_id, "render", exc)
+            finally:
+                await self._cancel_heartbeat(heartbeat)
 
     # -- clip poller (single scanning task) ------------------------------------
 
@@ -265,7 +458,7 @@ class PipelineWorkers:
                         break
                     await self._poll_one(sessionmaker, job_id, payload, created_at)
             except Exception:  # noqa: BLE001
-                logger.exception("clip poller scan error")
+                logger.exception("clip poller scan error (db=%s)", safe_db_target())
             await asyncio.sleep(self._settings.clip_poll_scan_interval_s)
 
     async def _poll_one(self, sessionmaker, job_id: str, payload, created_at) -> None:

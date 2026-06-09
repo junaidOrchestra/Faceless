@@ -67,5 +67,20 @@ services:
       redis:
         condition: service_healthy
 
+  # SeemlessFlow web frontend (Next.js). Talks to the orchestrator over the
+  # internal compose network; the bearer token is injected server-side only.
+  frontend:
+    build:
+      context: ./seemless
+    environment:
+      NEXT_PUBLIC_USE_ORCHESTRATOR: "1"
+      ORCHESTRATOR_URL: "http://orchestrator:8000"
+      # Must match API_AUTH_SECRET in orchestrator/.env.
+      ORCHESTRATOR_TOKEN: "dev-orch-secret"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - orchestrator
+
 volumes:
   pgdata:

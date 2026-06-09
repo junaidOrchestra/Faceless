@@ -37,6 +37,8 @@ class HttpClipClient(ClipClient):
         *,
         orientation: str | None = None,
         quality: str | None = None,
+        rank: bool = True,
+        per_page: int | None = None,
     ) -> None:
         body = ClipCreateJobRequest(
             job_id=job_id,
@@ -51,12 +53,18 @@ class HttpClipClient(ClipClient):
             credentials=ClipJobCredentials(
                 pexels=credentials.get("pexels"),
                 pixabay=credentials.get("pixabay"),
+                flickr=credentials.get("flickr"),
             ),
             # orientation is forwarded to Pexels so fetched media already matches
             # the target aspect ratio (landscape | portrait | square); quality
-            # selects the downloaded resolution tier (sd | hd | max).
+            # selects the downloaded resolution tier (sd | hd | max). rank=False
+            # (vibe mode) skips CLIP ranking server-side.
             options=ClipJobOptions(
-                min_score=0.15, orientation=orientation, quality=quality
+                min_score=0.15,
+                orientation=orientation,
+                quality=quality,
+                rank=rank,
+                per_page=per_page,
             ),
         )
         async with httpx.AsyncClient(base_url=self._base_url, timeout=60.0) as client:

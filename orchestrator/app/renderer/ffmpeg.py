@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import subprocess
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -34,20 +36,23 @@ _DOWNLOAD_BACKOFF_MAX_S = 8.0
 _FPS = 30
 
 # ASS subtitle template for "Hormozi-style" captions. PlayResX/Y match the frame
-# so Fontsize/margins are in pixels. The style is white with a heavy black
-# outline; the *active* word is recoloured yellow inline per event (see
-# ``_subtitle_filter``), giving the word-by-word highlight. Applied via the
-# ``ass`` filter inside the per-segment encode that already runs (no extra pass).
+# so Fontsize/margins are in pixels (sized off the short side in
+# ``_subtitle_filter`` so portrait isn't oversized). WrapStyle=0 enables smart
+# word wrapping so a wide chunk breaks onto another line instead of clipping.
+# The style is white with a heavy black outline; the *active* word is recoloured
+# yellow inline per event (see ``_subtitle_filter``), giving the word-by-word
+# highlight. Applied via the ``ass`` filter inside the per-segment encode that
+# already runs (no extra pass).
 _ASS_TEMPLATE = """[Script Info]
 ScriptType: v4.00+
 PlayResX: {width}
 PlayResY: {height}
-WrapStyle: 2
+WrapStyle: 0
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Caption,DejaVu Sans,{fontsize},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},2,40,40,{marginv},1
+Style: Caption,DejaVu Sans,{fontsize},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},2,{marginlr},{marginlr},{marginv},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -75,18 +80,28 @@ class FFmpegRenderer(Renderer):
         temp_dir: str,
         *,
         segment_concurrency: int = 4,
+        download_concurrency: int = 8,
         threads: int = 2,
         preset: str = "veryfast",
         crf: int = 20,
+        subprocess_timeout_s: float | None = None,
     ) -> None:
         self._temp_dir = Path(temp_dir)
         self._temp_dir.mkdir(parents=True, exist_ok=True)
         self._segment_concurrency = max(1, segment_concurrency)
+        self._download_concurrency = max(1, download_concurrency)
         self._threads = max(1, threads)
         self._preset = preset
         self._crf = crf
+        self._subprocess_timeout_s = subprocess_timeout_s
+        self._cpu_permits = threading.BoundedSemaphore(os.cpu_count() or 2)
 
-    def _encode_args(self) -> list[str]:
+    def _ffmpeg(self, args: list[str]) -> None:
+        """Run ffmpeg with this renderer's configured hard subprocess timeout."""
+
+        _run_ffmpeg(args, timeout_s=self._subprocess_timeout_s)
+
+    def _encode_args(self, threads: int | None = None) -> list[str]:
         """Identical libx264 output args shared by every segment encoder.
 
         Keeping these byte-for-byte consistent across photo/video/text segments
@@ -114,7 +129,7 @@ class FFmpegRenderer(Renderer):
             "-video_track_timescale",
             "90000",
             "-threads",
-            str(self._threads),
+            str(threads if threads is not None else self._threads),
         ]
 
     async def render(
@@ -139,22 +154,187 @@ class FFmpegRenderer(Renderer):
         height: int = 720,
     ) -> str:
         work = self._temp_dir / Path(output_path).stem
+        try:
+            return self._render_work(
+                work, audio_path, timeline, output_path, width, height
+            )
+        finally:
+            # Always remove the intermediate work dir — even when the render
+            # raises or is killed by the subprocess timeout — so a broken render
+            # can't leak seg_*/src files and slowly fill the disk.
+            if work != Path(output_path).parent:
+                shutil.rmtree(work, ignore_errors=True)
+
+    def _render_work(
+        self,
+        work: Path,
+        audio_path: str,
+        timeline: list[TimelineBeat],
+        output_path: str,
+        width: int = 1280,
+        height: int = 720,
+    ) -> str:
         work.mkdir(parents=True, exist_ok=True)
+        src_dir = work / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
         segment_files = [work / f"seg_{i:03d}.mp4" for i in range(len(timeline))]
 
-        # Render every beat (download + encode) in a bounded thread pool instead
-        # of one-at-a-time. Each task is subprocess/IO bound (urlopen + ffmpeg),
-        # so threads overlap the network waits and saturate the cores. Output
-        # paths are per-index, so the tasks never touch shared state.
-        workers = min(self._segment_concurrency, max(1, len(timeline)))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(
-                pool.map(
-                    lambda item: self._render_segment(
-                        item[0], item[1], work, width, height
-                    ),
-                    list(enumerate(timeline)),
+        # Two cooperating pools instead of one combined "download+encode" pool:
+        #   * a network-bound DOWNLOAD pool (urlopen releases the GIL), and
+        #   * a CPU-bound ENCODE pool (ffmpeg subprocesses).
+        # As each download lands we immediately submit its dependent encode(s),
+        # so the network waits of later beats overlap the ffmpeg work of earlier
+        # ones (the old combined pool capped I/O concurrency at the CPU
+        # concurrency and made each worker alternate wait->burn). Encodes write
+        # to per-index seg files, so they never share state.
+        #
+        # Downloads are also DEDUPED by URL: when one asset is reused across
+        # beats (motif reuse), it is fetched exactly once and every beat that
+        # references it encodes from the same local file.
+        url_to_indices: dict[str, list[int]] = {}
+        text_indices: list[int] = []
+        for i, beat in enumerate(timeline):
+            url = beat.media_url if beat.kind in ("photo", "video") else None
+            if url:
+                url_to_indices.setdefault(url, []).append(i)
+            else:
+                text_indices.append(i)
+
+        # Size the ENCODE pool to the host's cores. ffmpeg already gets
+        # `render_threads` per process, and the worker layer may run
+        # `render_concurrency` jobs at once, so running more parallel encodes
+        # than cores just oversubscribes the CPU (x264 threads thrash on
+        # context switches and every segment slows down). Cap at cpu_count and,
+        # once we're at one encode per core, drop each encode to a single x264
+        # thread so the product stays ~= cores. Downloads are network-bound, so
+        # the DOWNLOAD pool keeps its full configured width.
+        cpu = os.cpu_count() or 2
+        enc_workers = min(self._segment_concurrency, cpu, max(1, len(timeline)))
+        enc_threads = max(1, min(self._threads, max(1, cpu // enc_workers)))
+        dl_workers = min(self._download_concurrency, max(1, len(url_to_indices)))
+        logger.info(
+            "render scheduling: %s beats (%s unique assets, %s text), "
+            "encode=%sx%st download=%s on %s cpu",
+            len(timeline),
+            len(url_to_indices),
+            len(text_indices),
+            enc_workers,
+            enc_threads,
+            dl_workers,
+            cpu,
+        )
+
+        # Per-phase timing so a slow render is diagnosable: are we network-bound
+        # (sum of download seconds dominates) or CPU-bound (sum of encode
+        # seconds dominates)? List.append is atomic under the GIL, so the pools
+        # can record into these without an extra lock.
+        download_secs: list[float] = []
+        encode_secs: list[float] = []
+        encoded_segments: list[tuple[int, str, float, float]] = []
+
+        def _timed_download(url: str, dest: Path) -> Path:
+            t = time.monotonic()
+            try:
+                return _download_remote_asset(url, dest, timeout_s=120.0)
+            finally:
+                download_secs.append(time.monotonic() - t)
+
+        def _timed_encode(idx: int, beat: TimelineBeat, path: Path | None) -> Path:
+            t = time.monotonic()
+            acquired = 0
+            try:
+                # Shared across concurrent render jobs in this process. A single
+                # render can use all cores, but parallel renders share permits
+                # instead of each scheduling a full cpu_count worth of x264 work.
+                for _ in range(enc_threads):
+                    self._cpu_permits.acquire()
+                    acquired += 1
+                return self._encode_beat(
+                    idx, beat, path, work, width, height, threads=enc_threads
                 )
+            finally:
+                for _ in range(acquired):
+                    self._cpu_permits.release()
+                elapsed = time.monotonic() - t
+                encode_secs.append(elapsed)
+                encoded_segments.append(
+                    (idx, beat.kind, max(0.5, beat.end_s - beat.start_s), elapsed)
+                )
+
+        wall0 = time.monotonic()
+        encode_pool = ThreadPoolExecutor(max_workers=enc_workers)
+        download_pool = ThreadPoolExecutor(max_workers=dl_workers)
+        encode_futures = []
+        try:
+            # Text/rhetorical beats need no download — encode them right away.
+            for i in sorted(
+                text_indices,
+                key=lambda idx: timeline[idx].end_s - timeline[idx].start_s,
+                reverse=True,
+            ):
+                encode_futures.append(
+                    encode_pool.submit(_timed_encode, i, timeline[i], None)
+                )
+            # Kick off one download per unique URL.
+            urls_by_encode_weight = sorted(
+                url_to_indices,
+                key=lambda url: max(
+                    timeline[i].end_s - timeline[i].start_s for i in url_to_indices[url]
+                ),
+                reverse=True,
+            )
+            dl_future_to_url = {
+                download_pool.submit(
+                    _timed_download, url, src_dir / f"src_{k:03d}"
+                ): url
+                for k, url in enumerate(urls_by_encode_weight)
+            }
+            # As each download finishes, fan its local file out to every beat
+            # that uses it; encodes start while remaining downloads continue.
+            for dfut in as_completed(dl_future_to_url):
+                url = dl_future_to_url[dfut]
+                try:
+                    local_path = dfut.result()
+                except Exception as exc:  # noqa: BLE001 - one bad asset -> text fallback
+                    logger.warning(
+                        "asset download failed for %s: %s; affected beats use text fallback",
+                        url,
+                        exc,
+                    )
+                    local_path = None
+                for i in sorted(
+                    url_to_indices[url],
+                    key=lambda idx: timeline[idx].end_s - timeline[idx].start_s,
+                    reverse=True,
+                ):
+                    encode_futures.append(
+                        encode_pool.submit(_timed_encode, i, timeline[i], local_path)
+                    )
+            for fut in encode_futures:
+                fut.result()
+        finally:
+            download_pool.shutdown(wait=True)
+            encode_pool.shutdown(wait=True)
+        segments_wall = time.monotonic() - wall0
+        logger.info(
+            "render segments done in %.1fs wall | downloads: n=%s sum=%.1fs max=%.1fs | "
+            "encodes: n=%s sum=%.1fs max=%.1fs",
+            segments_wall,
+            len(download_secs),
+            sum(download_secs),
+            max(download_secs, default=0.0),
+            len(encode_secs),
+            sum(encode_secs),
+            max(encode_secs, default=0.0),
+        )
+        if encoded_segments:
+            slowest = sorted(encoded_segments, key=lambda item: item[3], reverse=True)[:5]
+            logger.info(
+                "render slowest encodes: %s",
+                "; ".join(
+                    f"seg_{idx:03d} kind={kind} dur={duration:.1f}s encode={elapsed:.1f}s"
+                    for idx, kind, duration, elapsed in slowest
+                ),
             )
 
         concat_list = work / "concat.txt"
@@ -169,7 +349,7 @@ class FFmpegRenderer(Renderer):
         # is continuous CFR without a second full-length encode — this avoids the
         # extra generation loss and roughly halves the encode CPU. The old
         # mixed-fps freeze risk is already handled at the per-segment encode.
-        _run_ffmpeg(
+        self._ffmpeg(
             [
                 "ffmpeg",
                 "-y",
@@ -186,8 +366,12 @@ class FFmpegRenderer(Renderer):
         )
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         # Video is already a clean CFR H.264 stream, so copy it and only encode
-        # audio; `-shortest` trims to whichever track ends first.
-        _run_ffmpeg(
+        # audio; `-shortest` trims to whichever track ends first. Map streams
+        # explicitly — the assembled video from input 0, the narration's audio
+        # from input 1 — because when the narration is itself a *video* file (a
+        # video upload/recording) ffmpeg's default stream selection could
+        # otherwise pull that file's video track into the output.
+        self._ffmpeg(
             [
                 "ffmpeg",
                 "-y",
@@ -195,6 +379,10 @@ class FFmpegRenderer(Renderer):
                 str(silent_video),
                 "-i",
                 audio_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
                 "-c:v",
                 "copy",
                 "-c:a",
@@ -204,45 +392,53 @@ class FFmpegRenderer(Renderer):
             ],
         )
         # The final mp4 lives at output_path (the mounted folder root); the work
-        # dir only holds intermediate seg_*.mp4/silent.mp4 — remove it so the
-        # output folder stays clean and easy to browse.
-        if work != Path(output_path).parent:
-            shutil.rmtree(work, ignore_errors=True)
+        # dir only holds intermediate seg_*.mp4/silent.mp4 and is removed by the
+        # caller's finally so it's cleaned up on success and failure alike.
         return output_path
 
-    def _render_segment(
-        self, i: int, beat: TimelineBeat, work: Path, width: int, height: int
+    def _encode_beat(
+        self,
+        i: int,
+        beat: TimelineBeat,
+        local_path: Path | None,
+        work: Path,
+        width: int,
+        height: int,
+        *,
+        threads: int | None = None,
     ) -> Path:
-        """Render one beat to ``seg_<i>.mp4``; fall back to a text card on failure."""
+        """Encode one beat to ``seg_<i>.mp4`` from an already-downloaded asset.
+
+        ``local_path`` is the on-disk media for media beats (``None`` for text
+        beats, or when the upstream download failed). Any failure — missing
+        asset or a bad ffmpeg encode — falls back to a text card so a single
+        bad stock asset can never fail the whole job.
+        """
 
         duration = max(0.5, beat.end_s - beat.start_s)
         seg_out = work / f"seg_{i:03d}.mp4"
         try:
             if beat.kind == "text" or beat.is_rhetorical:
                 self._render_text_card(
-                    beat.text_overlay or "...", duration, seg_out, width, height
+                    beat.text_overlay or "...", duration, seg_out, width, height,
+                    threads=threads,
                 )
+            elif local_path is None:
+                raise RuntimeError("asset unavailable (download failed)")
             elif beat.kind == "photo":
-                self._render_ken_burns(
-                    beat.media_url or "",
-                    duration,
-                    seg_out,
-                    width,
-                    height,
-                    overlay=beat.text_overlay,
+                self._encode_ken_burns(
+                    local_path, duration, seg_out, width, height,
+                    overlay=beat.text_overlay, threads=threads,
                 )
             else:
-                self._render_video_trim(
-                    beat.media_url or "",
-                    duration,
-                    seg_out,
-                    width,
-                    height,
-                    overlay=beat.text_overlay,
+                self._encode_video_trim(
+                    local_path, duration, seg_out, width, height,
+                    overlay=beat.text_overlay, threads=threads,
+                    source_in_s=beat.source_in_s,
                 )
         except Exception as exc:  # noqa: BLE001 - one bad stock asset must not fail the job
             logger.warning(
-                "media render failed for seg_%03d (%s): %s; using text card fallback",
+                "media encode failed for seg_%03d (%s): %s; using text card fallback",
                 i,
                 beat.media_url,
                 exc,
@@ -250,7 +446,8 @@ class FFmpegRenderer(Renderer):
             if isinstance(exc, subprocess.CalledProcessError):
                 logger.debug("ffmpeg stderr: %s", _stderr(exc))
             self._render_text_card(
-                beat.text_overlay or "...", duration, seg_out, width, height
+                beat.text_overlay or "...", duration, seg_out, width, height,
+                threads=threads,
             )
         return seg_out
 
@@ -314,28 +511,50 @@ class FFmpegRenderer(Renderer):
                     f"Dialogue: 0,{_ass_ts(w_start)},{_ass_ts(w_end)},Caption,,0,0,0,,{line}"
                 )
 
+        # Scale the type off the SHORT side (min of w/h), not the height: in
+        # portrait the height is the long side, so scaling by height made the
+        # font ~2x too big for the available width and (with no wrapping) the
+        # text overflowed and got clipped. min(w,h) gives a consistent caption
+        # size across landscape/portrait/square. Side margins scale with width
+        # so there's padding and the wrap budget is correct; WrapStyle=0 (smart
+        # wrap) lets a wide chunk break onto a second line instead of clipping.
+        base = min(width, height)
         ass = _ASS_TEMPLATE.format(
             width=width,
             height=height,
-            fontsize=max(30, round(height * 0.085)),
-            outline=max(2, round(height * 0.006)),
-            shadow=max(1, round(height * 0.002)),
+            fontsize=max(30, round(base * 0.085)),
+            outline=max(2, round(base * 0.006)),
+            shadow=max(1, round(base * 0.002)),
+            marginlr=max(40, round(width * 0.06)),
             marginv=round(height * 0.32),
             events="\n".join(events),
         )
         ass_path = out.with_suffix(".ass")
         ass_path.write_text(ass, encoding="utf-8")
-        return f"ass={ass_path.as_posix()}"
+        # `original_size` MUST be passed (matching PlayResX/PlayResY) or libass's
+        # aspect-ratio arithmetic mis-scales the fonts/positions whenever the
+        # output isn't the renderer's assumed default aspect — captions then come
+        # out stretched/offset on 9:16 and 1:1. Pinning it to the real frame size
+        # sets pixel aspect = 1 and the correct storage size, so the captions
+        # track every aspect ratio. (See ffmpeg `ass` filter `original_size` docs.)
+        return f"ass={ass_path.as_posix()}:original_size={width}x{height}"
 
     def _render_text_card(
-        self, text: str, duration: float, out: Path, width: int, height: int
+        self,
+        text: str,
+        duration: float,
+        out: Path,
+        width: int,
+        height: int,
+        *,
+        threads: int | None = None,
     ) -> None:
         text_file = out.with_suffix(".txt")
         safe = text.replace("\r", " ").replace("\n", " ")[:120]
         text_file.write_text(safe, encoding="utf-8")
         # Scale font with frame height so text stays readable in portrait/landscape.
         fontsize = max(28, round(height * 0.058))
-        _run_ffmpeg(
+        self._ffmpeg(
             [
                 "ffmpeg",
                 "-y",
@@ -350,26 +569,26 @@ class FFmpegRenderer(Renderer):
                     "x=(w-text_w)/2:y=(h-text_h)/2:"
                     "expansion=none,setsar=1"
                 ),
-                *self._encode_args(),
+                *self._encode_args(threads),
                 "-t",
                 str(duration),
                 str(out),
             ],
         )
 
-    def _render_ken_burns(
+    def _encode_ken_burns(
         self,
-        image_url: str,
+        image_input: Path,
         duration: float,
         out: Path,
         width: int,
         height: int,
         *,
         overlay: str | None = None,
+        threads: int | None = None,
     ) -> None:
-        # Download remote photos first. Rendering directly from Pexels URLs makes
-        # the whole job vulnerable to one transient network/HTTP read failure.
-        image_input = _download_remote_asset(image_url, out.with_suffix(".image"))
+        # ``image_input`` is the already-downloaded local photo (downloads run in
+        # the shared, deduped download pool — see ``_render_sync``).
         vf = (
             f"{self._cover_filter(width, height)},"
             f"zoompan=z='min(zoom+0.0015,1.2)':d=125:fps={_FPS}:"
@@ -379,7 +598,7 @@ class FFmpegRenderer(Renderer):
         overlay_filter = self._subtitle_filter(overlay, out, width, height, duration)
         if overlay_filter:
             vf = f"{vf},{overlay_filter}"
-        _run_ffmpeg(
+        self._ffmpeg(
             [
                 "ffmpeg",
                 "-y",
@@ -391,53 +610,55 @@ class FFmpegRenderer(Renderer):
                 vf,
                 "-t",
                 str(duration),
-                *self._encode_args(),
+                *self._encode_args(threads),
                 str(out),
             ],
         )
 
-    def _render_video_trim(
+    def _encode_video_trim(
         self,
-        video_url: str,
+        video_input: Path,
         duration: float,
         out: Path,
         width: int,
         height: int,
         *,
         overlay: str | None = None,
+        threads: int | None = None,
+        source_in_s: float | None = None,
     ) -> None:
-        # Download the clip first. Streaming straight from a stock CDN makes the
-        # whole job vulnerable to a transient network drop mid-read (TLS pull
-        # errors / premature EOF -> a cascade of corrupt-NAL decode failures).
-        # ``-stream_loop -1`` also needs a seekable local file to re-loop
-        # reliably; it cannot rewind a remote HTTP stream.
-        # Download to a distinct "<stem>_src" base so the local file can never
-        # resolve to the output path (a video URL's .mp4 suffix would otherwise
-        # collide with seg_NNN.mp4 -> "Output same as Input" failure).
-        video_input = _download_remote_asset(
-            video_url, out.with_name(f"{out.stem}_src"), timeout_s=120.0
-        )
-        # ``-stream_loop -1`` loops the source so a stock clip shorter than its
-        # timeline slot still fills the full duration (with ``-t`` clamping the
-        # output). This keeps every slot exactly ``duration`` long, so the
-        # concatenated video never ends up shorter than the audio.
+        # ``video_input`` is the already-downloaded local clip (downloads run in
+        # the shared, deduped download pool — see ``_render_sync``). It lives in a
+        # separate ``src/`` dir, so its .mp4 suffix can never collide with the
+        # seg_NNN.mp4 output ("Output same as Input"). A local seekable file is
+        # also required for ``-stream_loop -1`` / ``-ss`` to seek reliably.
         vf = f"{self._cover_filter(width, height)},setsar=1"
         overlay_filter = self._subtitle_filter(overlay, out, width, height, duration)
         if overlay_filter:
             vf = f"{vf},{overlay_filter}"
-        _run_ffmpeg(
+        if source_in_s is not None:
+            # User-supplied source video: cut exactly this beat's window
+            # ``[source_in_s, source_in_s+duration]`` so the footage stays in sync
+            # with the narration. Input ``-ss`` (before ``-i``) is fast and seeks
+            # to the nearest preceding keyframe; no stream loop — the source spans
+            # the whole narration, so the window always exists.
+            input_args = ["-ss", f"{max(0.0, source_in_s):.3f}", "-i", str(video_input)]
+        else:
+            # ``-stream_loop -1`` loops a stock clip shorter than its timeline slot
+            # so it still fills the full duration (``-t`` clamps the output). This
+            # keeps every slot exactly ``duration`` long, so the concatenated video
+            # never ends up shorter than the audio.
+            input_args = ["-stream_loop", "-1", "-i", str(video_input)]
+        self._ffmpeg(
             [
                 "ffmpeg",
                 "-y",
-                "-stream_loop",
-                "-1",
-                "-i",
-                str(video_input),
+                *input_args,
                 "-t",
                 str(duration),
                 "-vf",
                 vf,
-                *self._encode_args(),
+                *self._encode_args(threads),
                 str(out),
             ],
         )
@@ -450,11 +671,20 @@ def _stderr(exc: subprocess.CalledProcessError) -> str:
     return str(stderr or "")
 
 
-def _run_ffmpeg(args: list[str]) -> None:
+def _run_ffmpeg(args: list[str], *, timeout_s: float | None = None) -> None:
+    cmd = args
+    if args and Path(args[0]).name.lower().startswith("ffmpeg"):
+        cmd = [args[0], "-hide_banner", "-loglevel", "error", *args[1:]]
     try:
-        subprocess.run(args, check=True, capture_output=True, text=True)
+        # ``timeout`` makes subprocess.run send SIGKILL on expiry, so a wedged
+        # ffmpeg (corrupt input, filter deadlock) can never pin a render worker
+        # or CPU forever — it raises TimeoutExpired and the render fails cleanly.
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        logger.error("ffmpeg timed out after %ss: %s", timeout_s, " ".join(cmd))
+        raise
     except subprocess.CalledProcessError as exc:
-        logger.error("ffmpeg failed: %s", " ".join(args))
+        logger.error("ffmpeg failed: %s", " ".join(cmd))
         logger.error("ffmpeg stderr: %s", _stderr(exc))
         raise
 
@@ -470,8 +700,11 @@ def _download_remote_asset(url: str, target: Path, *, timeout_s: float = 30.0) -
     last_exc: Exception | None = None
     for attempt in range(1, _DOWNLOAD_MAX_ATTEMPTS + 1):
         try:
-            with urlopen(request, timeout=timeout_s) as response:
-                local.write_bytes(response.read())
+            # Stream straight to disk rather than buffering the whole file in
+            # memory (HD/4K clips can be tens of MB each, and many download in
+            # parallel) — overlaps the socket read with the disk write too.
+            with urlopen(request, timeout=timeout_s) as response, open(local, "wb") as fh:
+                shutil.copyfileobj(response, fh, length=1024 * 1024)
             return local
         except Exception as exc:  # noqa: BLE001 - retry any transient network/DNS error
             last_exc = exc

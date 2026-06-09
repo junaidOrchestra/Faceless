@@ -1,0 +1,16 @@
+# Standalone compose for just the Brollio frontend. For the full stack
+# (orchestrator + clip-server + db + redis + frontend) use the root
+# docker-compose.yml one level up.
+services:
+  frontend:
+    build:
+      context: .
+    environment:
+      # Talk to an already-running orchestrator. Override as needed.
+      NEXT_PUBLIC_USE_ORCHESTRATOR: "1"
+      ORCHESTRATOR_URL: "http://host.docker.internal:8000"
+      ORCHESTRATOR_TOKEN: "dev-orch-secret"
+    ports:
+      - "3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

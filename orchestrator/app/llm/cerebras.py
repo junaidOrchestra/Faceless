@@ -91,12 +91,19 @@ def _clean_queries(values: Any) -> list[str]:
 
 # Map the visual-director enum to the legacy BeatQueryPlan.visual_type string.
 _VTYPE_TO_PLAN = {
+    VisualType.person: "person",
+    VisualType.event: "event",
     VisualType.broll: "broll",
     VisualType.symbolic: "symbolic",
 }
 
 # Types that actually issue a stock search (need at least one query phrase).
-_SEARCH_TYPES = {VisualType.broll, VisualType.symbolic}
+_SEARCH_TYPES = {
+    VisualType.person,
+    VisualType.event,
+    VisualType.broll,
+    VisualType.symbolic,
+}
 
 
 class _Truncated(Exception):
@@ -193,6 +200,44 @@ class CerebrasProvider(LLMProvider):
         # Runs here so both the pipeline and the inspect tool see the corrected
         # classification.
         return normalize_beat_visuals(out, beats)
+
+    async def theme_keywords(
+        self,
+        theme: str,
+        count: int,
+        *,
+        examples: list[str] | None = None,
+    ) -> list[str]:
+        """One JSON call: N varied stock-search phrases for a single visual theme."""
+
+        n = max(1, count)
+        example_line = (
+            f"Example phrases for this theme: {', '.join(examples)}.\n" if examples else ""
+        )
+        system = (
+            "You generate stock-footage SEARCH PHRASES for a single visual THEME. "
+            'Return STRICT JSON: {"keywords": [str]}.\n'
+            f"- Return EXACTLY {n} phrases (repeat a couple only if unavoidable).\n"
+            "- Each phrase: 1-3 plain, concrete words that return MANY real videos "
+            "on Pexels (e.g. 'sand dunes', 'rocket launch', 'forest path').\n"
+            "- Cover DIFFERENT sub-scenes of the theme so the video stays varied; "
+            "avoid near-duplicates, abstract nouns, and made-up phrases.\n"
+            "- Every phrase must clearly belong to the given theme."
+        )
+        user = f"THEME: {theme}\nN: {n}\n{example_line}"
+        try:
+            content, _ = await self._complete(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                {"type": "json_object"},
+            )
+        except Exception as exc:  # noqa: BLE001 - vibe keywords fall back to the seed list
+            logger.warning("theme_keywords failed for %r: %s", theme, exc)
+            return []
+        raw = _loads_object(content)
+        return _clean_queries(raw.get("keywords") or [])[:n]
 
     async def beat_queries(
         self,

@@ -1,0 +1,10 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+# Latest yt-dlp + the bgutil PO-token plugin so YouTube's gated (non-HLS)
+# formats download without manual cookies. Plugin talks to the pot-provider
+# sidecar over HTTP (see docker-compose.yml).
+yt-dlp>=2025.9.23
+bgutil-ytdlp-pot-provider>=1.3.1
+python-multipart==0.0.20
+pydantic==2.10.4

@@ -19,8 +19,14 @@ class ClipClient(ABC):
         *,
         orientation: str | None = None,
         quality: str | None = None,
+        rank: bool = True,
+        per_page: int | None = None,
     ) -> None:
-        """Submit a batch job (fire-and-forget). Idempotent on ``job_id``."""
+        """Submit a batch job (fire-and-forget). Idempotent on ``job_id``.
+
+        ``rank=False`` (vibe mode) tells the server to skip CLIP ranking and return
+        raw source results; ``per_page`` overrides results-per-source-query.
+        """
 
     @abstractmethod
     async def poll(self, job_id: str) -> ClipJobStatusResponse:

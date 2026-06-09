@@ -28,9 +28,12 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import storage
+from . import vibe_pipeline
+from . import vibes as vibe_registry
 from .clip_client.base import ClipClient
 from .clip_client.schemas import ClipRankedAsset
 from .config import Settings
+from .formats import search_orientation
 from .llm.base import LLMProvider, Vocabulary
 from .renderer.base import Renderer, TimelineBeat
 from .services import video_jobs as job_service
@@ -42,9 +45,11 @@ logger = logging.getLogger(__name__)
 def _clip_keywords(plan: Any, vocabulary: Vocabulary, *, limit: int = 3) -> list[str]:
     """Return several stock-search keywords for one beat.
 
-    Sending up to three short queries (visual first, then metaphor, then a
-    vocabulary fallback) gives CLIP a wider candidate pool than relying on the
-    model's first guess, while keeping the request bounded.
+    Use the beat's OWN visual/metaphor queries (up to ``limit``). The global
+    vocabulary (shared subjects/topic) is only a LAST RESORT for a beat the model
+    left empty — never a top-up. Appending a shared subject to beats that already
+    had queries made the same asset (e.g. a "log cabin") surface as a candidate on
+    nearly every beat and polluted the whole video.
     """
 
     out: list[str] = []
@@ -57,12 +62,18 @@ def _clip_keywords(plan: Any, vocabulary: Vocabulary, *, limit: int = 3) -> list
             out.append(cleaned)
         if len(out) >= limit:
             return out
+
+    # The beat produced at least one query of its own: keep it tight and on-topic.
+    if out:
+        return out
+
+    # Empty beat only: fall back to a single shared vocabulary phrase.
     for keyword in [*vocabulary.subjects, vocabulary.topic or "abstract background"]:
         cleaned = " ".join(str(keyword).split()).strip()
         key = cleaned.lower()
         if cleaned and key not in seen:
-            return out + [cleaned]
-    return out or ["abstract background"]
+            return [cleaned]
+    return ["abstract background"]
 
 
 def _ref_beat(ref: str) -> int:
@@ -215,12 +226,31 @@ async def stage_llm(
     credentials = payload.get("credentials") or {}
     sources: list[str] | None = payload.get("sources") or settings.default_sources
     fmt = payload.get("format") or {}
-    orientation: str | None = fmt.get("orientation")
+    orientation: str | None = search_orientation(fmt.get("orientation"))
     quality: str | None = payload.get("quality")
 
     beats = await job_service.get_beats(session, job_id)
     if not beats:
         return False
+
+    # Vibe mode: the user chose a visual theme instead of "match my script". Skip
+    # the transcript-driven vocabulary + visual director entirely and hand off to
+    # the separate vibe pipeline, which fetches an UNRANKED pool of theme clips
+    # (tiled by duration into beats once the search completes).
+    theme = payload.get("theme") or {}
+    if str(theme.get("mode") or "script").lower() == "vibe" and vibe_registry.is_vibe(
+        theme.get("vibe")
+    ):
+        return await vibe_pipeline.submit_vibe_pool(
+            session,
+            settings,
+            job_id,
+            payload,
+            beats,
+            str(theme.get("vibe")),
+            llm=llm,
+            clip_client=clip_client,
+        )
 
     beats_payload = [
         {"index": b.index, "text": b.text, "start_s": b.start_s, "end_s": b.end_s}
@@ -245,10 +275,21 @@ async def stage_llm(
     max_items = max(1, settings.clip_max_items_per_job)
     per_beat_limit = max(1, min(3, max_items // len(beats)))
 
+    # Per-beat source routing: beats the visual director classifies as a real
+    # named "person" or a specific named "event" want authentic photographs (route
+    # to Openverse/Pexels, configurable), while everything else keeps the default
+    # stock sources (Pexels). Routing is per-beat, so within one transcript some
+    # beats hit pexels_video and named person/event beats hit Openverse. Each list
+    # falls back to the default sources if left empty.
+    person_sources: list[str] | None = settings.person_sources or sources
+    event_sources: list[str] | None = settings.event_sources or sources
+    routed_sources = {"person": person_sources, "event": event_sources}
+
     beats_with_queries: list[dict[str, Any]] = []
     clip_items: list[dict[str, Any]] = []
     for b, plan in zip(beats, plans, strict=True):
         keywords = _clip_keywords(plan, vocabulary, limit=per_beat_limit)
+        item_sources = routed_sources.get(plan.visual_type, sources)
         beats_with_queries.append(
             {
                 "index": b.index,
@@ -267,7 +308,7 @@ async def stage_llm(
         )
         for q_index, keyword in enumerate(keywords):
             clip_items.append(
-                {"ref": f"{b.index}:{q_index}", "keyword": keyword, "sources": sources}
+                {"ref": f"{b.index}:{q_index}", "keyword": keyword, "sources": item_sources}
             )
 
     await job_service.save_beats(session, job_id, beats_with_queries)
@@ -327,8 +368,26 @@ async def poll_clip_job(
         # queued / running / processing — still searching.
         return "pending"
 
+    # Vibe mode: hand the finished (unranked) pool to the separate vibe pipeline,
+    # which tiles the clips by duration into beats. Keeps the script assembly
+    # below fully isolated from the vibe path.
+    theme = payload.get("theme") or {}
+    if str(theme.get("mode") or "script").lower() == "vibe" and vibe_registry.is_vibe(
+        theme.get("vibe")
+    ):
+        return await vibe_pipeline.assemble_vibe_timeline(
+            session, job_id, str(theme.get("vibe")), status
+        )
+
     by_ref = {item.ref: item for item in status.items}
     beats = await job_service.get_beats(session, job_id)
+
+    # If the narration came from a user video, that footage is offered as a
+    # swappable alternate on every beat — but the DEFAULT (rendered) pick is the
+    # best-ranked stock match for the beat's text. The user's footage only
+    # becomes the default when no stock asset matched the beat (it always covers
+    # the beat, so there is still no text fallback in this mode). See below.
+    source_video_url = (payload.get("source_video") or {}).get("url")
 
     # Re-run safety: clear any assignments from a previous (interrupted) poll.
     await job_service.clear_assignments(session, job_id)
@@ -370,6 +429,72 @@ async def poll_clip_job(
             if errors:
                 logger.warning("beat %s clip errors: %s", b.index, "; ".join(errors))
 
+        # Stock alternates for this beat, best-scoring first. Marked unselected
+        # for now; the default is chosen below (user video if present, else the
+        # top stock pick). Up to three so the picker shows a few options.
+        stock_candidates: list[dict[str, Any]] = []
+        if asset is not None:
+            stock_candidates.append(_asset_to_candidate(asset, selected=False))
+            for alt in pool:
+                if len(stock_candidates) >= 3:
+                    break
+                if alt.media_url == asset.media_url:
+                    continue
+                stock_candidates.append(_asset_to_candidate(alt, selected=False))
+
+        if source_video_url:
+            # The user's footage is always an available candidate, but it is no
+            # longer auto-selected: the best-ranked stock match leads. The user
+            # video is sliced to this beat's window at render time (the renderer
+            # seeks to beat.start_s) only if the user picks it.
+            user_candidate = {
+                "platform": "user_video",
+                "kind": "video",
+                "media_url": source_video_url,
+                "preview_url": source_video_url,
+                "score": 1.0,
+                "attribution": "Your footage",
+                "selected": False,
+            }
+            if asset is not None:
+                # Stock best match is the default; user footage trails as an
+                # alternate the user can switch to.
+                candidates = [
+                    {**stock_candidates[0], "selected": True},
+                    *stock_candidates[1:],
+                    user_candidate,
+                ][:4]
+                await job_service.save_assignment(
+                    session,
+                    job_id,
+                    b.index,
+                    platform=asset.platform,
+                    media_url=asset.media_url,
+                    kind=asset.kind,
+                    score=asset.score,
+                    attribution=asset.attribution_name,
+                    preview_url=asset.preview_url,
+                    candidates=candidates,
+                )
+            else:
+                # No stock match for this beat — fall back to the user's footage
+                # as the default (better than a text card when we have footage).
+                user_candidate["selected"] = True
+                await job_service.save_assignment(
+                    session,
+                    job_id,
+                    b.index,
+                    platform="user_video",
+                    media_url=source_video_url,
+                    kind="video",
+                    score=1.0,
+                    attribution="Your footage",
+                    preview_url=source_video_url,
+                    candidates=[user_candidate, *stock_candidates][:4],
+                )
+            visual_beats += 1
+            continue
+
         if asset is None:
             # No candidates, or all already used earlier — the only place text is
             # allowed in the video.
@@ -389,15 +514,9 @@ async def poll_clip_job(
             fallback_beats += 1
             continue
 
-        # Selected first, then up to two distinct alternates by score, so the UI
-        # can show one default + two options (each with preview_url + media_url).
-        candidates = [_asset_to_candidate(asset, selected=True)]
-        for alt in pool:
-            if len(candidates) >= 3:
-                break
-            if alt.media_url == asset.media_url:
-                continue
-            candidates.append(_asset_to_candidate(alt, selected=False))
+        # Stock default: promote the top pick to selected, keep the rest as
+        # alternates (each with preview_url + media_url for the UI).
+        candidates = [{**stock_candidates[0], "selected": True}, *stock_candidates[1:]]
 
         await job_service.save_assignment(
             session,
@@ -457,8 +576,8 @@ async def stage_render(
     out_width = int(fmt.get("width") or 1920)
     out_height = int(fmt.get("height") or 1080)
 
-    pairs = await job_service.get_beats_with_assignments(session, job_id)
-    if not pairs:
+    render_rows = await job_service.get_render_beats(session, job_id)
+    if not render_rows:
         raise RuntimeError("No beats to render — run the earlier stages first.")
 
     # Render is on-demand and may run after a restart that wiped ephemeral /tmp,
@@ -470,7 +589,7 @@ async def stage_render(
 
     segments = [
         BeatSegment(index=b.index, text=b.text, start_s=b.start_s, end_s=b.end_s)
-        for b, _ in pairs
+        for b in render_rows
     ]
     audio_duration_s = await asyncio.to_thread(_probe_audio_duration, audio_path)
     boundaries = _clip_boundaries(segments, audio_duration_s)
@@ -483,20 +602,26 @@ async def stage_render(
 
     show_subs = bool(payload.get("subtitles"))
     timeline: list[TimelineBeat] = []
-    for i, (beat, assignment) in enumerate(pairs):
+    for i, beat in enumerate(render_rows):
         clip_start = boundaries[i]
         clip_end = boundaries[i + 1]
-        if assignment is not None and assignment.media_url:
+        if beat.media_url:
+            # For the user's own video, the media_url is the whole uploaded clip;
+            # seek into it at this beat's narration start so each beat shows the
+            # matching slice (the source's audio == the narration, so beat.start_s
+            # is the correct in-point). Stock clips have no in-point (start at 0).
+            is_user_video = (beat.platform or "").lower() == "user_video"
             timeline.append(
                 TimelineBeat(
                     clip_start,
                     clip_end,
-                    kind=assignment.kind or "photo",
+                    kind=beat.kind or "photo",
                     # Burn the beat's narration as a bottom caption when subtitles
                     # are requested; the renderer draws it during the per-segment
                     # encode it already runs (no extra pass).
-                    media_url=assignment.media_url,
+                    media_url=beat.media_url,
                     text_overlay=beat.text if show_subs else None,
+                    source_in_s=float(beat.start_s) if is_user_video else None,
                 )
             )
         else:

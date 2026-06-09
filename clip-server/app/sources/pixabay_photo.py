@@ -90,7 +90,7 @@ class PixabayPhotoSource(StockSource):
                     attribution_url=hit.get("pageURL"),
                     license="Pixabay License",
                     duration=None,
-                    raw=hit,
+                    raw={"pageURL": hit.get("pageURL"), "tags": hit.get("tags")},
                 )
             )
         return candidates

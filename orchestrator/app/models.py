@@ -11,11 +11,75 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Float, Integer, String, Text, func
+from sqlalchemy import BigInteger, DateTime, Float, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
+
+
+class User(Base):
+    """A user mirror keyed by the Supabase auth id (the JWT ``sub``, a UUID).
+
+    Authentication lives in Supabase; this row is our own copy of the identity
+    plus all app-owned state (tier, credit balance). ``credits`` is the running
+    balance kept in sync with the append-only ``credit_transactions`` ledger.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    email: Mapped[str | None] = mapped_column(Text, nullable=True)
+    name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tier: Mapped[str] = mapped_column(String(32), nullable=False, default="free")
+    credits: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Start of the period the current free/paid grant belongs to. Used by the
+    # check-on-use monthly reset to detect when a new period has begun.
+    credits_granted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    stripe_customer_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class Project(Base):
+    """A single video belonging to a user (one project == one video)."""
+
+    __tablename__ = "projects"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    input_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="created")
+    result_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class CreditTransaction(Base):
+    """Append-only credit ledger. ``users.credits`` is the running balance."""
+
+    __tablename__ = "credit_transactions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Signed change: +grant / -spend / +refund.
+    delta: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    project_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class VideoJob(Base):
@@ -23,12 +87,19 @@ class VideoJob(Base):
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # Ownership + project linkage (added with accounts). ``owner_id`` mirrors the
+    # Supabase user id; ``project_id`` ties the job to its Project row.
+    owner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    project_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="queued")
     progress: Mapped[str | None] = mapped_column(String(64), nullable=True)
     result_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     audio_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

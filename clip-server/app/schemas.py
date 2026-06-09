@@ -44,6 +44,7 @@ class JobCredentials(BaseModel):
 
     pexels: str | None = Field(default=None, description="Pexels API key.", examples=["***"])
     pixabay: str | None = Field(default=None, description="Pixabay API key.", examples=["***"])
+    flickr: str | None = Field(default=None, description="Flickr API key.", examples=["***"])
 
 
 class JobOptions(BaseModel):
@@ -64,6 +65,15 @@ class JobOptions(BaseModel):
         ge=0.0,
         le=1.0,
         description="Minimum cosine similarity to include an asset.",
+    )
+    rank: bool = Field(
+        default=True,
+        description=(
+            "When true (default), download+CLIP-embed each preview and rank by "
+            "cosine similarity to the keyword. When false, skip embedding entirely "
+            "and return the raw source results (deduped, with durations) — used for "
+            "ambient 'vibe' clips that don't need semantic matching."
+        ),
     )
 
 

@@ -138,7 +138,7 @@ def test_missing_index_gets_safe_default() -> None:
 
 
 def test_only_stock_visual_types_exist() -> None:
-    assert {t.value for t in VisualType} == {"broll", "symbolic"}
+    assert {t.value for t in VisualType} == {"person", "event", "broll", "symbolic"}
 
 
 def test_overlay_is_always_cleared() -> None:

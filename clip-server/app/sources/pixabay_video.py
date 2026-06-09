@@ -100,7 +100,7 @@ class PixabayVideoSource(StockSource):
                     attribution_url=hit.get("pageURL"),
                     license="Pixabay License",
                     duration=float(hit.get("duration") or 0) or None,
-                    raw=hit,
+                    raw={"pageURL": hit.get("pageURL"), "tags": hit.get("tags")},
                 )
             )
         return candidates

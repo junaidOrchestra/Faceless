@@ -52,11 +52,29 @@ async def _embed_texts(embedder: Embedder, lock: asyncio.Lock, texts: list[str])
         return await asyncio.to_thread(embedder.embed_texts, texts)
 
 
-async def _embed_images(embedder: Embedder, lock: asyncio.Lock, images: list[bytes]) -> np.ndarray:
-    """Embed images off the event loop, serialized (see :func:`_embed_texts`)."""
+async def _embed_images(
+    embedder: Embedder,
+    lock: asyncio.Lock,
+    images: list[bytes],
+    *,
+    batch_size: int,
+) -> np.ndarray:
+    """Embed images in bounded chunks off the event loop.
 
-    async with lock:
-        return await asyncio.to_thread(embedder.embed_images, images)
+    Decoding a large preview set all at once can hold many compressed blobs plus
+    decoded RGB PIL images in memory. Chunking preserves ranking quality while
+    reducing the peak allocation per CLIP forward pass.
+    """
+
+    if not images:
+        return np.zeros((0, 0), dtype=np.float32)
+    chunks: list[np.ndarray] = []
+    size = max(1, batch_size)
+    for start in range(0, len(images), size):
+        batch = images[start : start + size]
+        async with lock:
+            chunks.append(await asyncio.to_thread(embedder.embed_images, batch))
+    return np.vstack(chunks) if chunks else np.zeros((0, 0), dtype=np.float32)
 
 
 def _stub_preview_bytes(url: str) -> bytes:
@@ -73,36 +91,142 @@ def _stub_preview_bytes(url: str) -> bytes:
 
 
 def _is_decodable_image(blob: bytes) -> bool:
-    """True if PIL can actually decode the bytes as an image.
+    """True if PIL recognizes the bytes as an image.
 
     A passing ``content-type: image/*`` header is not enough: stock CDNs can
     return HTML error pages, unsupported formats, or corrupt bodies with a 200.
-    Decoding here (where we still know which candidate the blob belongs to) lets
-    us drop just that candidate, instead of one bad preview raising deep inside
-    the batched ``embed_images`` call and failing the whole keyword item.
+    Use PIL's lightweight ``verify`` here so good images are fully decoded only
+    once, during CLIP embedding.
     """
 
     try:
         with Image.open(io.BytesIO(blob)) as img:
-            img.convert("RGB")
+            img.verify()
         return True
     except Exception:  # noqa: BLE001 - any decode failure means "unusable preview"
         return False
 
 
-async def _download_preview(client: httpx.AsyncClient, url: str) -> bytes | None:
+async def _download_preview(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    max_bytes: int,
+    timeout_s: float | None = None,
+) -> bytes | None:
     if url.startswith("stub://"):
         return _stub_preview_bytes(url)
+
+    async def _read() -> bytes | None:
+        async with client.stream("GET", url, follow_redirects=True) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if not content_type.startswith("image/"):
+                return None
+            content_length = response.headers.get("content-length")
+            if content_length:
+                try:
+                    declared_size = int(content_length)
+                except ValueError:
+                    declared_size = 0
+                if declared_size > max_bytes:
+                    logger.debug("preview too large for %s: %s bytes", url, content_length)
+                    return None
+
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    logger.debug("preview exceeded %s bytes for %s", max_bytes, url)
+                    return None
+                chunks.append(chunk)
+            return b"".join(chunks)
+
     try:
-        response = await client.get(url, follow_redirects=True)
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "")
-        if not content_type.startswith("image/"):
-            return None
-        return response.content
+        # Total wall-clock cap per preview: a slow/slowloris CDN that streams
+        # bytes under the per-read timeout would otherwise hold a download slot
+        # indefinitely. A timed-out preview is simply skipped (returns None).
+        if timeout_s is not None:
+            return await asyncio.wait_for(_read(), timeout=timeout_s)
+        return await _read()
     except Exception as exc:  # noqa: BLE001 - one bad preview must not fail the item
         logger.debug("preview download failed for %s: %s", url, exc)
         return None
+
+
+async def _collect_unranked(
+    settings: Settings,
+    item: dict[str, Any],
+    credentials: dict[str, str | None],
+    options: dict[str, Any],
+    http_client: httpx.AsyncClient,
+) -> dict[str, Any]:
+    """Vibe-mode path: return raw source results WITHOUT CLIP embedding/ranking.
+
+    Ambient "vibe" clips are random by design and never matched to specific text,
+    so the expensive embed-preview + cosine-rank step is pure overhead here. We
+    just fan out the source searches, dedupe by ``(platform, external_id)``, and
+    return up to ``per_page`` candidates with their durations so the orchestrator
+    can tile them along the narration timeline. Kept fully separate from the
+    ranked path so neither can affect the other.
+    """
+
+    ref = item["ref"]
+    keyword: str = item["keyword"]
+    source_names: list[str] = item.get("sources") or settings.enabled_sources
+    per_page = int(options.get("per_page") or settings.default_per_page)
+
+    async def _search(name: str) -> list[Candidate]:
+        try:
+            source = get_source(name)
+            if (
+                source.requires_key
+                and source.credential_key
+                and not credentials.get(source.credential_key)
+            ):
+                return []
+            return await source.search(
+                keyword, per_page, credentials, options, http_client=http_client
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad source must not fail the item
+            logger.warning("unranked source %s failed for ref=%s: %s", name, ref, exc)
+            return []
+
+    pool: list[Candidate] = []
+    for found in await asyncio.gather(*[_search(n) for n in source_names]):
+        pool.extend(found)
+
+    seen: set[tuple[str, str]] = set()
+    assets: list[dict[str, Any]] = []
+    for c in pool:
+        key = (c.platform, c.external_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        assets.append(
+            {
+                "platform": c.platform,
+                "kind": c.kind,
+                "media_url": c.media_url,
+                "preview_url": c.preview_url,
+                "attribution_name": c.attribution_name,
+                "attribution_url": c.attribution_url,
+                "license": c.license,
+                "duration": c.duration,
+                # Unranked: no cosine score, so use a neutral 1.0 (source order kept).
+                "score": 1.0,
+            }
+        )
+        if len(assets) >= per_page:
+            break
+
+    logger.info("unranked pool for ref=%s: %s clips (no embedding)", ref, len(assets))
+    return {
+        "ref": ref,
+        "assets": assets,
+        "error": None if assets else "No candidates found.",
+    }
 
 
 async def process_item(
@@ -116,6 +240,10 @@ async def process_item(
     embed_lock: asyncio.Lock,
 ) -> dict[str, Any]:
     """Process a single keyword item and return a result dict (ref + assets)."""
+
+    # Vibe mode opts out of CLIP ranking — short-circuit to the raw-pool path.
+    if not bool(options.get("rank", True)):
+        return await _collect_unranked(settings, item, credentials, options, http_client)
 
     ref = item["ref"]
     keyword: str = item["keyword"]
@@ -228,7 +356,12 @@ async def process_item(
 
         async def _fetch(candidate: Candidate) -> tuple[Candidate, bytes | None]:
             async with sem:
-                blob = await _download_preview(http_client, candidate.preview_url)
+                blob = await _download_preview(
+                    http_client,
+                    candidate.preview_url,
+                    max_bytes=settings.preview_max_bytes,
+                    timeout_s=settings.preview_total_timeout_s,
+                )
             return candidate, blob
 
         fetched = await asyncio.gather(*[_fetch(c) for c in missing_pool])
@@ -250,7 +383,12 @@ async def process_item(
         if candidates_with_preview:
             # CLIP image-embed the previews (batched), rank against the keyword.
             image_bytes = [blob for _, blob in candidates_with_preview]
-            image_embeddings = await _embed_images(embedder, embed_lock, image_bytes)
+            image_embeddings = await _embed_images(
+                embedder,
+                embed_lock,
+                image_bytes,
+                batch_size=settings.image_embed_batch_size,
+            )
             for (candidate, _), vec in zip(candidates_with_preview, image_embeddings, strict=True):
                 score = _cosine(keyword_vec, vec)
                 if score < min_score:
@@ -280,6 +418,8 @@ async def run_job(
     items: list[dict[str, Any]],
     credentials: dict[str, str | None],
     options: dict[str, Any],
+    *,
+    embed_lock: asyncio.Lock | None = None,
 ) -> list[dict[str, Any]]:
     """Run the pipeline for every item in a job.
 
@@ -292,7 +432,7 @@ async def run_job(
     """
 
     headers = {"User-Agent": settings.http_user_agent}
-    embed_lock = asyncio.Lock()
+    embed_lock = embed_lock or asyncio.Lock()
     sem = asyncio.Semaphore(max(1, settings.item_concurrency))
 
     async with httpx.AsyncClient(

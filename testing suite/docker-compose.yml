@@ -1,0 +1,44 @@
+# Faceless Video — Testing Suite
+# UI + backend that turns YouTube links into finished videos by driving the
+# orchestrator API end-to-end. Run with:  docker compose up --build
+services:
+  # Generates YouTube PO tokens so yt-dlp can fetch the good (non-HLS) formats
+  # without manual cookies. The backend's yt-dlp plugin calls it over HTTP.
+  pot-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    init: true
+    expose:
+      - "4416"
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      - .env
+    environment:
+      OUTPUT_DIR: /app/output
+      WORK_DIR: /app/work
+      POT_PROVIDER_URL: http://pot-provider:4416
+    depends_on:
+      - pot-provider
+    volumes:
+      # Finished MP4s land here on the host for easy access.
+      - ./output:/app/output
+      # Drop a cookies.txt (exported from a logged-in browser) into ./cookies to
+      # fetch rate-limited / bot-checked / age-restricted videos. Auto-detected,
+      # no further config needed.
+      - ./cookies:/app/cookies:ro
+    expose:
+      - "8800"
+    ports:
+      # Exposed for direct API access / debugging (UI uses the nginx proxy).
+      - "8899:8800"
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "8090:80"

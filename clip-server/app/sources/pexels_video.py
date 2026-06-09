@@ -93,7 +93,7 @@ class PexelsVideoSource(StockSource):
                     attribution_url=video.get("url"),
                     license="Pexels License",
                     duration=float(video.get("duration") or 0) or None,
-                    raw=video,
+                    raw={"url": video.get("url"), "width": video.get("width"), "height": video.get("height")},
                 )
             )
         return candidates

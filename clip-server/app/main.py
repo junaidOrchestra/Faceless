@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
@@ -32,15 +34,42 @@ from .worker import JobWorker
 logger = logging.getLogger(__name__)
 
 
+def _configure_torch_threads(settings: Settings) -> None:
+    """Apply CPU thread limits before sentence-transformers imports torch."""
+
+    threads = int(settings.clip_torch_threads or 0)
+    interop = int(settings.clip_torch_interop_threads or 0)
+    if threads > 0:
+        os.environ.setdefault("OMP_NUM_THREADS", str(threads))
+        os.environ.setdefault("MKL_NUM_THREADS", str(threads))
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", str(threads))
+    try:
+        import torch
+
+        if threads > 0:
+            torch.set_num_threads(threads)
+        if interop > 0:
+            torch.set_num_interop_threads(interop)
+    except Exception as exc:  # noqa: BLE001 - thread tuning must not block startup
+        logger.warning("could not configure torch thread limits: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load CLIP once, start the durable job worker, clean up on shutdown."""
 
     settings = get_settings()
     configure_logging(settings.log_level)
-    embedder = ClipEmbedder(settings.clip_model_name, device=settings.clip_device)
+    _configure_torch_threads(settings)
+    embed_lock = asyncio.Lock()
+    embedder = ClipEmbedder(
+        settings.clip_model_name,
+        device=settings.clip_device,
+        text_cache_size=settings.text_embed_cache_size,
+    )
     app.state.embedder = embedder
-    worker = JobWorker(settings, embedder)
+    app.state.embed_lock = embed_lock
+    worker = JobWorker(settings, embedder, embed_lock=embed_lock)
     app.state.worker = worker
     await worker.start()
     logger.info("CLIP server started (version=%s)", __version__)
@@ -109,15 +138,31 @@ async def create_job(
 ) -> CreateJobResponse:
     _validate_create_job(body, settings)
     items_payload = [item.model_dump() for item in body.items]
-    await job_service.upsert_job(
-        session,
-        body.job_id,
-        {
-            "items": items_payload,
-            "credentials": body.credentials.model_dump(),
-            "options": body.options.model_dump(exclude_none=True),
-        },
-    )
+    credentials = body.credentials.model_dump()
+    # Fall back to the process-wide Flickr key so editorial routing works even
+    # when the caller doesn't pass one per request. The per-source guard only
+    # runs a key-requiring source when its credential is present in this dict.
+    if not credentials.get("flickr") and settings.flickr_api_key:
+        credentials["flickr"] = settings.flickr_api_key
+    try:
+        await job_service.upsert_job(
+            session,
+            body.job_id,
+            {
+                "items": items_payload,
+                "credentials": credentials,
+                "options": body.options.model_dump(exclude_none=True),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - surface the real cause, not a blank 500
+        # Most likely a DB connection/schema problem (the job row never persists).
+        # Log the full traceback and return the error type so the orchestrator's
+        # logs show *why* the submit failed instead of an opaque 500.
+        logger.exception("failed to create job %s", body.job_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not persist job: {type(exc).__name__}: {exc}",
+        ) from exc
     return CreateJobResponse(job_id=body.job_id)
 
 
@@ -175,8 +220,20 @@ async def get_job(
     description="Utility endpoint returning L2-normalized CLIP text vectors.",
     dependencies=[Depends(require_auth)],
 )
-async def text_embed(body: TextEmbedRequest, embedder: EmbedderDep, settings: SettingsDep) -> TextEmbedResponse:
-    vectors = embedder.embed_texts(body.texts)
+async def text_embed(
+    body: TextEmbedRequest,
+    request: Request,
+    embedder: EmbedderDep,
+    settings: SettingsDep,
+) -> TextEmbedResponse:
+    if len(body.texts) > settings.max_text_embed_texts:
+        raise HTTPException(status_code=400, detail="Too many texts.")
+    embed_lock = getattr(request.app.state, "embed_lock", None)
+    if embed_lock is None:
+        embed_lock = asyncio.Lock()
+        request.app.state.embed_lock = embed_lock
+    async with embed_lock:
+        vectors = await asyncio.to_thread(embedder.embed_texts, body.texts)
     return TextEmbedResponse(
         embeddings=vectors.astype(float).tolist(),
         dim=settings.embedding_dim,

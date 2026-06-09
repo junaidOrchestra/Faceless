@@ -20,6 +20,8 @@ class Vocabulary:
 # Simplified set: every beat is a concrete stock search (broll/symbolic). No
 # planned text cards, map/data/archival special-casing, or text overlays.
 VISUAL_TYPES: tuple[str, ...] = (
+    "person",      # real, named individual -> authentic photos (Openverse/Flickr)
+    "event",       # specific named historical event -> archive photos
     "broll",       # concrete, filmable thing/action -> stock B-roll
     "symbolic",    # abstract idea -> concrete stand-in stock search
     "fallback",    # none of the above -> symbolic stock search
@@ -53,3 +55,23 @@ class LLMProvider(ABC):
         context: Vocabulary,
     ) -> list[BeatQueryPlan]:
         """Single batched call returning one plan per beat (same order as input)."""
+
+    async def theme_keywords(
+        self,
+        theme: str,
+        count: int,
+        *,
+        examples: list[str] | None = None,
+    ) -> list[str]:
+        """Return up to ``count`` stock-search phrases for a single visual THEME.
+
+        Used by vibe-mode (the user picked a vibe instead of "match my script"),
+        where visuals come from the theme rather than the transcript. ``examples``
+        are representative phrases that steer the model. Implementations may return
+        fewer than ``count`` (the caller tops up from a curated seed list). The
+        default returns nothing so providers without a structured-output path
+        simply fall back to the seed keywords.
+        """
+
+        del theme, count, examples
+        return []

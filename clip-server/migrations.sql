@@ -10,10 +10,15 @@ CREATE TABLE IF NOT EXISTS jobs (
     error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    claimed_at TIMESTAMPTZ
+    claimed_at TIMESTAMPTZ,
+    heartbeat_at TIMESTAMPTZ,
+    attempt_count INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs (status, created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_running_heartbeat
+    ON jobs (status, heartbeat_at)
+    WHERE status = 'running';
 
 CREATE TABLE IF NOT EXISTS assets (
     asset_id BIGSERIAL PRIMARY KEY,

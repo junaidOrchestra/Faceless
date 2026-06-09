@@ -18,6 +18,7 @@ class ClipJobItemInput(BaseModel):
 class ClipJobCredentials(BaseModel):
     pexels: str | None = None
     pixabay: str | None = None
+    flickr: str | None = None
 
 
 class ClipJobOptions(BaseModel):
@@ -25,6 +26,9 @@ class ClipJobOptions(BaseModel):
     quality: str | None = None
     per_page: int | None = None
     min_score: float | None = None
+    # When false, the clip server returns raw source results without CLIP ranking
+    # (vibe mode). Default true keeps the script-matching path unchanged.
+    rank: bool = True
 
 
 class ClipCreateJobRequest(BaseModel):

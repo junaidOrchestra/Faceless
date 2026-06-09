@@ -7,7 +7,9 @@ import asyncio
 import pytest
 from httpx import AsyncClient
 
-AUTH = {"Authorization": "Bearer test-secret"}
+from ._auth import auth_header, make_token
+
+AUTH = auth_header(make_token(sub="smoke-user", email="smoke@example.com"))
 
 
 async def _poll_until(client: AsyncClient, job_id: str, *targets: str) -> dict:

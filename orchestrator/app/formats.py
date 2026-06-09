@@ -58,6 +58,22 @@ def valid_formats() -> list[str]:
     return sorted(ACCEPTED_FORMATS)
 
 
+def search_orientation(orientation: str | None) -> str | None:
+    """Orientation filter to forward to the stock provider (Pexels).
+
+    Portrait (9:16) outputs — shorts/reels/tiktok — intentionally search WITHOUT
+    an orientation filter: Pexels' portrait inventory is comparatively small, so
+    constraining to it starves results. Cover-scaling/cropping a landscape clip
+    to vertical at render time gives better coverage than a thin portrait-only
+    pool. Landscape (16:9) and square keep their filter so widescreen output
+    still gets aspect-matched media.
+    """
+
+    if orientation == "portrait":
+        return None
+    return orientation
+
+
 def _normalize(value: str) -> str:
     out = []
     for ch in value.strip().lower():

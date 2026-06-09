@@ -1,0 +1,118 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Light theme (default). Tokens are "R G B" triplets so Tailwind can apply
+     opacity modifiers via rgb(var(--token) / <alpha-value>). */
+  :root {
+    color-scheme: light;
+
+    --canvas: 241 238 231;
+    --panel: 252 251 248;
+    --panel-raised: 235 231 222;
+    --panel-hover: 226 221 210;
+    --hairline: 221 215 203;
+    --cream: 26 23 18; /* primary text */
+    --faint: 107 106 99; /* muted text */
+    --accent: 214 154 30;
+    --accent-hover: 224 165 42;
+    --accent-foreground: 26 20 7;
+    --destructive: 201 42 47;
+    --destructive-foreground: 255 255 255;
+
+    --shimmer: rgba(0, 0, 0, 0.05);
+    --scrollbar-thumb: #d4cdbf;
+    --scrollbar-thumb-hover: #c2bba9;
+    --panel-shadow: 0 1px 2px 0 rgba(40, 30, 10, 0.07),
+      0 1px 0 0 rgba(255, 255, 255, 0.6) inset;
+    --vignette: radial-gradient(
+        80rem 40rem at 80% -10%,
+        rgba(214, 154, 30, 0.07),
+        transparent 60%
+      ),
+      radial-gradient(60rem 40rem at -10% 110%, rgba(214, 154, 30, 0.05), transparent 55%);
+  }
+
+  /* Dark "studio editor" theme. */
+  .dark {
+    color-scheme: dark;
+
+    --canvas: 14 15 18;
+    --panel: 22 24 28;
+    --panel-raised: 28 31 37;
+    --panel-hover: 34 38 45;
+    --hairline: 38 42 49;
+    --cream: 242 237 228;
+    --faint: 154 160 170;
+    --accent: 244 183 64;
+    --accent-hover: 247 198 96;
+    --accent-foreground: 26 20 7;
+    --destructive: 229 72 77;
+    --destructive-foreground: 255 255 255;
+
+    --shimmer: rgba(255, 255, 255, 0.06);
+    --scrollbar-thumb: #2b3039;
+    --scrollbar-thumb-hover: #3a414c;
+    --panel-shadow: 0 1px 0 0 rgba(255, 255, 255, 0.02) inset,
+      0 1px 2px 0 rgba(0, 0, 0, 0.4);
+    --vignette: radial-gradient(
+        80rem 40rem at 80% -10%,
+        rgba(244, 183, 64, 0.05),
+        transparent 60%
+      ),
+      radial-gradient(60rem 40rem at -10% 110%, rgba(244, 183, 64, 0.03), transparent 55%);
+  }
+
+  * {
+    @apply border-hairline;
+  }
+
+  body {
+    @apply bg-canvas text-cream font-sans antialiased;
+    /* Subtle warm vignette so neither theme reads as flat. */
+    background-image: var(--vignette);
+    background-attachment: fixed;
+  }
+
+  ::selection {
+    @apply bg-accent/30 text-cream;
+  }
+
+  /* Slim studio scrollbars. */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--scrollbar-thumb-hover);
+    background-clip: content-box;
+  }
+}
+
+@layer components {
+  /* A raised studio panel: hairline border + soft inner highlight. */
+  .panel {
+    @apply rounded-xl border border-hairline bg-panel;
+    box-shadow: var(--panel-shadow);
+  }
+
+  .skeleton {
+    @apply relative overflow-hidden bg-panel-raised;
+  }
+  .skeleton::after {
+    content: "";
+    @apply absolute inset-0 -translate-x-full;
+    background: linear-gradient(90deg, transparent, var(--shimmer), transparent);
+    animation: shimmer 1.5s infinite;
+  }
+}

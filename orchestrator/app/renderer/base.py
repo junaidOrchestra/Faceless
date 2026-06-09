@@ -15,6 +15,10 @@ class TimelineBeat:
     media_url: str | None
     text_overlay: str | None = None  # text card body, or optional stock overlay
     is_rhetorical: bool = False
+    # In-point (seconds) to seek to within ``media_url`` before trimming. Set for
+    # user-supplied source video so each beat shows its own slice; ``None`` for
+    # stock clips, which always start from the top (and may loop to fill).
+    source_in_s: float | None = None
 
 
 class Renderer(ABC):

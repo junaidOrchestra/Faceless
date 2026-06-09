@@ -76,7 +76,7 @@ class PexelsPhotoSource(StockSource):
                     attribution_url=photo.get("photographer_url"),
                     license="Pexels License",
                     duration=None,
-                    raw=photo,
+                    raw={"url": photo.get("url"), "width": photo.get("width"), "height": photo.get("height")},
                 )
             )
         return candidates

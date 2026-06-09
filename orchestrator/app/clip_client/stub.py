@@ -26,8 +26,10 @@ class StubClipClient(ClipClient):
         *,
         orientation: str | None = None,
         quality: str | None = None,
+        rank: bool = True,
+        per_page: int | None = None,
     ) -> None:
-        del credentials, sources, orientation, quality
+        del credentials, sources, orientation, quality, rank, per_page
         self._jobs[job_id] = list(items)
 
     async def poll(self, job_id: str) -> ClipJobStatusResponse:

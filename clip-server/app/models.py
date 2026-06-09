@@ -42,6 +42,8 @@ class Job(Base):
         nullable=False,
     )
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(nullable=False, default=0)
 
 
 class Asset(Base):

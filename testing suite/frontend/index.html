@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Faceless Video · Testing Suite</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="logo">▣</span>
+          <div>
+            <h1>Faceless Video — Testing Suite</h1>
+            <p class="sub">YouTube link in, finished video out. Fully automated.</p>
+          </div>
+        </div>
+        <div class="orch" id="orchInfo">connecting…</div>
+      </header>
+
+      <main class="grid">
+        <!-- Setup panel -->
+        <section class="panel" id="setupPanel">
+          <div class="panel-head">
+            <h2>1 · Add sources</h2>
+            <div class="head-actions">
+              <button class="ghost" id="addRowBtn" type="button">+ Add link</button>
+              <button class="ghost" id="uploadBtn" type="button">↑ Upload audio</button>
+              <input id="fileInput" type="file" accept="audio/*,video/*" multiple hidden />
+            </div>
+          </div>
+
+          <div class="defaults">
+            <span class="defaults-label">Defaults for new rows</span>
+            <div class="defaults-row">
+              <label>
+                Content
+                <select id="defTheme"></select>
+              </label>
+              <label class="vibewrap" id="defVibeWrap" hidden>
+                Vibe
+                <select id="defVibe"></select>
+              </label>
+              <label>
+                Aspect
+                <select id="defFormat"></select>
+              </label>
+              <label>
+                Quality
+                <select id="defQuality"></select>
+              </label>
+              <label class="check">
+                <input type="checkbox" id="defSubtitles" checked />
+                Subtitles
+              </label>
+            </div>
+          </div>
+
+          <div class="rows" id="rows"></div>
+
+          <div class="actions">
+            <label class="check autodl">
+              <input type="checkbox" id="autoDownload" />
+              Auto-download finished videos
+            </label>
+            <button class="primary" id="runBtn" type="button">Run pipeline</button>
+          </div>
+        </section>
+
+        <!-- Results panel -->
+        <section class="panel results" id="resultsPanel">
+          <div class="panel-head">
+            <h2>2 · Results</h2>
+            <div class="batch-stats" id="batchStats"></div>
+          </div>
+          <div class="empty" id="emptyState">
+            <p>No runs yet. Add YouTube links and hit <strong>Run pipeline</strong>.</p>
+          </div>
+          <div class="jobs" id="jobs"></div>
+        </section>
+      </main>
+    </div>
+
+    <template id="rowTpl">
+      <div class="row">
+        <input class="url" type="text" placeholder="https://www.youtube.com/watch?v=…" />
+        <select class="theme"></select>
+        <select class="vibe" hidden></select>
+        <select class="format"></select>
+        <select class="quality"></select>
+        <label class="check"><input type="checkbox" class="subtitles" checked />Subs</label>
+        <button class="remove" type="button" title="Remove">✕</button>
+      </div>
+    </template>
+
+    <script src="app.js"></script>
+  </body>
+</html>

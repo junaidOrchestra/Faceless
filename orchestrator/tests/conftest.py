@@ -13,7 +13,7 @@ from sqlalchemy import delete
 from app.config import get_settings
 from app.db import get_sessionmaker
 from app.main import app
-from app.models import Beat, BeatAssignment, VideoJob
+from app.models import Beat, BeatAssignment, CreditTransaction, Project, User, VideoJob
 
 @pytest.fixture(scope="session", autouse=True)
 def _env() -> None:
@@ -26,6 +26,11 @@ def _env() -> None:
     os.environ.setdefault("LLM_PROVIDER", "stub")
     os.environ.setdefault("USE_STUB_CLIP", "1")
     os.environ.setdefault("USE_STUB_RENDERER", "1")
+    # Identity: verify HS256 tokens minted by tests/_auth.py.
+    os.environ.setdefault("SUPABASE_JWT_SECRET", "test-jwt-secret")
+    os.environ.setdefault("SUPABASE_JWT_AUDIENCE", "authenticated")
+    # Keep tests deterministic: no per-user request throttling.
+    os.environ.setdefault("RATE_LIMIT_ENABLED", "false")
     get_settings.cache_clear()
 
 
@@ -36,6 +41,9 @@ async def client() -> AsyncIterator[AsyncClient]:
         await session.execute(delete(BeatAssignment))
         await session.execute(delete(Beat))
         await session.execute(delete(VideoJob))
+        await session.execute(delete(CreditTransaction))
+        await session.execute(delete(Project))
+        await session.execute(delete(User))
         await session.commit()
 
     # Drive the app lifespan explicitly so the staged worker pools + clip poller

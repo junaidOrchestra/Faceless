@@ -35,3 +35,5 @@ CREATE TABLE IF NOT EXISTS beat_assignments (
     attribution TEXT,
     PRIMARY KEY (video_job_id, beat_index)
 );
+
+DATABASE_URL ''
