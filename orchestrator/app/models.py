@@ -82,6 +82,32 @@ class CreditTransaction(Base):
     )
 
 
+class Feedback(Base):
+    """A user-submitted suggestion, improvement, bug report, or note.
+
+    Kept deliberately simple and append-only: every submission is a row we can
+    triage later. ``user_id`` ties it to the authenticated submitter; ``email``
+    is an optional reply-to (defaults to the account email) so we can follow up.
+    """
+
+    __tablename__ = "feedback"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    category: Mapped[str] = mapped_column(String(32), nullable=False, default="suggestion")
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    # Optional 1-5 satisfaction signal captured alongside the note.
+    rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    email: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Lightweight context to help us reproduce/triage: the page the user was on
+    # and their browser UA. Never required.
+    page: Mapped[str | None] = mapped_column(Text, nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class VideoJob(Base):
     __tablename__ = "video_jobs"
 
@@ -114,6 +140,19 @@ class Beat(Base):
     start_s: Mapped[float] = mapped_column(Float, nullable=False)
     end_s: Mapped[float] = mapped_column(Float, nullable=False)
     queries: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Per-word timing for "tighten audio" (filler-word removal + caption sync).
+    # A list of {"t": text, "s": start_s, "e": end_s, "f": is_filler}. Nullable so
+    # older jobs (transcribed before this column) still load.
+    words: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
+    # Beat origin. "narration" (default) = a transcript-derived beat backed by a
+    # narration time window [start_s, end_s]. "insert" = a user-added standalone
+    # animated text card with NO narration: it contributes ``duration_s`` of video
+    # and an equal silent gap in the muxed audio (its own per-word SFX is mixed on
+    # top). ``start_s == end_s`` for inserts (the narration time it sits at).
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, server_default="narration")
+    # On-screen / silent-gap duration in seconds for "insert" beats. NULL/0 for
+    # narration beats, whose duration comes from their narration window instead.
+    duration_s: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class BeatAssignment(Base):

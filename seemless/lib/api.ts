@@ -1,11 +1,24 @@
-import type { Asset, Aspect, ContentTheme, Quality, VideoJob } from "./types";
+import type {
+  AnimatedTextConfig,
+  Asset,
+  Aspect,
+  Beat,
+  ContentTheme,
+  Quality,
+  VideoJob,
+  Word,
+} from "./types";
+import type { RelWord } from "./animated-text";
 import { makeMockBase, makeSearchResults, MOCK_LOADING_BEATS } from "./mock";
-import { sleep } from "./utils";
+import { resyncWords, sleep } from "./utils";
 import {
   orchGetVideoJob,
+  orchInsertAnimatedBeat,
   orchPrepare,
   orchSearchClips,
   orchStartRender,
+  orchUpdateBeatText,
+  orchUploadAnimatedClip,
   orchUploadAudio,
   orchUploadOwnClip,
 } from "./orchestrator";
@@ -195,10 +208,144 @@ export async function uploadOwnClip(
   };
 }
 
+/**
+ * Persist a recorded animated text-card clip as the chosen visual for a beat and
+ * return the Asset to add to the beat's candidates.
+ *
+ * The returned asset's `mediaUrl` is a LOCAL blob URL (instant, always works for
+ * preview); the render uses the backend-stored copy via the candidate index
+ * encoded in the asset id (`o-{beat}-{candidateIndex}-animated`). In mock mode
+ * (no orchestrator) it's a purely local asset.
+ */
+export async function uploadAnimatedClip(
+  jobId: string,
+  beatIndex: number,
+  blob: Blob,
+  config: AnimatedTextConfig,
+): Promise<Asset> {
+  const previewUrl = URL.createObjectURL(blob);
+  if (USE_ORCHESTRATOR) {
+    const { candidateIndex } = await orchUploadAnimatedClip(jobId, beatIndex, blob, config);
+    return {
+      id: `o-${beatIndex}-${candidateIndex}-animated`,
+      thumbUrl: "",
+      source: "animated",
+      kind: "video",
+      mediaUrl: previewUrl,
+      animated: config,
+    };
+  }
+  await sleep(300);
+  return {
+    id: `animated-${beatIndex}-${Date.now()}`,
+    thumbUrl: "",
+    source: "animated",
+    kind: "video",
+    mediaUrl: previewUrl,
+    animated: config,
+  };
+}
+
+/**
+ * Insert a brand-new standalone animated text-card beat. The card has no
+ * narration; the backend stores the recorded clip and splices a silent audio gap
+ * of `durationS` at the insert position. Callers should re-fetch the job because
+ * backend beat indices shift.
+ */
+export async function insertAnimatedBeat(
+  jobId: string,
+  position: number,
+  text: string,
+  durationS: number,
+  blob: Blob,
+  config: AnimatedTextConfig,
+  words: RelWord[],
+): Promise<void> {
+  if (USE_ORCHESTRATOR) {
+    await orchInsertAnimatedBeat(jobId, position, text, durationS, blob, config, words);
+    return;
+  }
+
+  await sleep(300);
+  const entry = ensureMockJob(jobId);
+  const previewUrl = URL.createObjectURL(blob);
+  const insertAt = Math.max(0, Math.min(position, entry.base.beats.length));
+  const assetId = `animated-insert-${Date.now()}`;
+  const anchor =
+    insertAt < entry.base.beats.length
+      ? entry.base.beats[insertAt].from
+      : Math.max(0, ...entry.base.beats.map((b) => b.to));
+  const inserted: Beat = {
+    index: insertAt,
+    from: anchor,
+    to: anchor + durationS,
+    text,
+    visualType: "text_card",
+    overlay: text.slice(0, 60),
+    loading: false,
+    included: true,
+    chosenAssetId: assetId,
+    candidates: [
+      {
+        id: assetId,
+        thumbUrl: "",
+        source: "animated",
+        kind: "video",
+        mediaUrl: previewUrl,
+        animated: config,
+      },
+    ],
+    words: words.map((w) => ({ text: w.text, from: w.from, to: w.to, filler: false })),
+    kind: "insert",
+    durationS,
+  };
+  entry.base = {
+    ...entry.base,
+    beats: [
+      ...entry.base.beats.slice(0, insertAt),
+      inserted,
+      ...entry.base.beats.slice(insertAt).map((b) => ({ ...b, index: b.index + 1 })),
+    ],
+  };
+}
+
+/**
+ * Correct a beat's transcript text (a typo fix). Only the caption text changes —
+ * timing, audio, and clips are untouched. Returns the corrected text plus the
+ * re-synced per-word timing (when the word count is unchanged). `currentWords`
+ * seeds the mock/offline path; the orchestrator returns authoritative words.
+ */
+export async function updateBeatText(
+  jobId: string,
+  beatIndex: number,
+  text: string,
+  currentWords?: Word[],
+): Promise<{ text: string; words: Word[] }> {
+  const clean = text.trim();
+  if (USE_ORCHESTRATOR) {
+    return orchUpdateBeatText(jobId, beatIndex, clean);
+  }
+  await sleep(150);
+  const entry = ensureMockJob(jobId);
+  const beat = entry.base.beats.find((b) => b.index === beatIndex);
+  const words = resyncWords(currentWords ?? beat?.words, clean) ?? [];
+  if (beat) {
+    entry.base = {
+      ...entry.base,
+      beats: entry.base.beats.map((b) =>
+        b.index === beatIndex ? { ...b, text: clean, words } : b,
+      ),
+    };
+  }
+  return { text: clean, words };
+}
+
 export type RenderSettings = {
   aspect: Aspect;
   captions: boolean;
   music: boolean;
+  removeSilence: boolean;
+  removeFillers: boolean;
 };
 
 /** POST /videos/{id}/render — kick off the final render.
@@ -210,12 +357,16 @@ export async function startRender(
   jobId: string,
   settings: RenderSettings,
   overrides?: Record<number, number>,
+  excludedBeats?: number[],
 ): Promise<void> {
   if (USE_ORCHESTRATOR) {
     await orchStartRender(jobId, {
       overrides,
+      excludedBeats,
       aspect: settings.aspect,
       captions: settings.captions,
+      removeSilence: settings.removeSilence,
+      removeFillers: settings.removeFillers,
     });
     return;
   }

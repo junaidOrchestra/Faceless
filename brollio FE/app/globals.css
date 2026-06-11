@@ -1,0 +1,176 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Light theme (default). Tokens are "R G B" triplets so Tailwind can apply
+     opacity modifiers via rgb(var(--token) / <alpha-value>). */
+  :root {
+    color-scheme: light;
+
+    --canvas: 241 238 231;
+    --panel: 252 251 248;
+    --panel-raised: 235 231 222;
+    --panel-hover: 226 221 210;
+    --hairline: 221 215 203;
+    --cream: 26 23 18;
+    --faint: 107 106 99;
+    --accent: 214 154 30;
+    --accent-hover: 224 165 42;
+    --accent-foreground: 26 20 7;
+
+    --shimmer: rgba(0, 0, 0, 0.05);
+    --panel-shadow: 0 1px 2px 0 rgba(40, 30, 10, 0.07),
+      0 1px 0 0 rgba(255, 255, 255, 0.6) inset;
+    --glow: rgba(214, 154, 30, 0.22);
+    --vignette: radial-gradient(
+        80rem 44rem at 80% -10%,
+        rgba(214, 154, 30, 0.08),
+        transparent 60%
+      ),
+      radial-gradient(60rem 40rem at -10% 110%, rgba(214, 154, 30, 0.05), transparent 55%);
+    --grid-line: rgba(26, 23, 18, 0.045);
+  }
+
+  /* Dark "studio" theme. */
+  .dark {
+    color-scheme: dark;
+
+    --canvas: 14 15 18;
+    --panel: 22 24 28;
+    --panel-raised: 28 31 37;
+    --panel-hover: 34 38 45;
+    --hairline: 38 42 49;
+    --cream: 242 237 228;
+    --faint: 154 160 170;
+    --accent: 244 183 64;
+    --accent-hover: 247 198 96;
+    --accent-foreground: 26 20 7;
+
+    --shimmer: rgba(255, 255, 255, 0.06);
+    --panel-shadow: 0 1px 0 0 rgba(255, 255, 255, 0.02) inset,
+      0 1px 2px 0 rgba(0, 0, 0, 0.4);
+    --glow: rgba(244, 183, 64, 0.28);
+    --vignette: radial-gradient(
+        80rem 44rem at 80% -10%,
+        rgba(244, 183, 64, 0.06),
+        transparent 60%
+      ),
+      radial-gradient(60rem 40rem at -10% 110%, rgba(244, 183, 64, 0.04), transparent 55%);
+    --grid-line: rgba(255, 255, 255, 0.035);
+  }
+
+  * {
+    @apply border-hairline;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    scroll-padding-top: 5rem;
+  }
+
+  body {
+    @apply bg-canvas text-cream font-sans antialiased;
+    background-image: var(--vignette);
+    background-attachment: fixed;
+  }
+
+  ::selection {
+    @apply bg-accent/30 text-cream;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-panel-hover;
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply rounded-xl border border-hairline bg-panel;
+    box-shadow: var(--panel-shadow);
+  }
+
+  /* Buttons -------------------------------------------------------------- */
+  .btn {
+    @apply inline-flex select-none items-center justify-center gap-2 rounded-lg px-4 py-2.5
+      text-sm font-semibold transition-all duration-200 focus-visible:outline-none
+      focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2
+      focus-visible:ring-offset-canvas disabled:pointer-events-none disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-accent text-accent-foreground hover:bg-accent-hover
+      shadow-[0_8px_24px_-8px_var(--glow)] hover:shadow-[0_12px_30px_-8px_var(--glow)]
+      hover:-translate-y-0.5;
+  }
+  .btn-secondary {
+    @apply btn border border-hairline bg-panel text-cream hover:bg-panel-hover hover:-translate-y-0.5;
+  }
+  .btn-ghost {
+    @apply btn text-faint hover:bg-panel-hover hover:text-cream;
+  }
+  .btn-lg {
+    @apply px-5 py-3 text-base;
+  }
+
+  /* Small pill / eyebrow ------------------------------------------------- */
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full border border-hairline bg-panel
+      px-3 py-1 text-xs font-medium text-faint;
+  }
+
+  /* Faint dotted grid backdrop for sections ------------------------------ */
+  .grid-bg {
+    background-image: linear-gradient(var(--grid-line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+    background-size: 48px 48px;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+  /* Amber gradient text for hero emphasis. */
+  .text-gradient {
+    background-image: linear-gradient(
+      120deg,
+      rgb(var(--accent)),
+      rgb(var(--accent-hover))
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  /* Reveal-on-scroll: starts hidden, .is-visible plays the rise. */
+  .reveal {
+    opacity: 0;
+    transform: translateY(22px);
+    transition: opacity 0.7s cubic-bezier(0.16, 1, 0.3, 1),
+      transform 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+    will-change: opacity, transform;
+  }
+  .reveal.is-visible {
+    opacity: 1;
+    transform: none;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .reveal {
+      opacity: 1;
+      transform: none;
+      transition: none;
+    }
+    html {
+      scroll-behavior: auto;
+    }
+  }
+}

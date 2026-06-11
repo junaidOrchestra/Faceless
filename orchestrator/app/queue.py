@@ -55,6 +55,29 @@ class RedisQueue:
 
         await get_redis().rpush(self.queue_key, job_id)
 
+    async def enqueue_once(self, job_id: str, *, guard_ttl_s: int = 86_400) -> bool:
+        """Enqueue ``job_id`` at most once across racing callers.
+
+        Two independent code paths can decide to dispatch the same job into a
+        stage at the same moment (e.g. the transcribe worker noticing a job is
+        ``prepared`` while ``POST /prepare`` concurrently flips that flag). A
+        plain double ``enqueue`` would put the id on the queue twice and let two
+        workers claim it. This takes a short-lived ``SET NX`` guard in Redis so
+        only the first caller pushes; later callers no-op and return ``False``.
+
+        The guard expires after ``guard_ttl_s`` purely as cleanup — recovery
+        paths (startup ``rebuild`` / orphan requeue) use the plain ``enqueue``
+        and are intentionally not gated, so a legitimately retried job is never
+        blocked by a stale guard.
+        """
+
+        redis = get_redis()
+        won = await redis.set(f"{self.name}:enqueued:{job_id}", "1", nx=True, ex=guard_ttl_s)
+        if not won:
+            return False
+        await redis.rpush(self.queue_key, job_id)
+        return True
+
     async def claim(self, timeout_s: float) -> str | None:
         """Block up to ``timeout_s`` for the next job id, moving it to processing.
 

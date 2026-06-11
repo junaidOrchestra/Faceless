@@ -6,7 +6,8 @@ import { Loader2 } from "lucide-react";
 import { TopBar } from "@/components/topbar";
 import { Storyboard } from "@/components/storyboard";
 import { Sidebar } from "@/components/sidebar";
-import { ClipPicker } from "@/components/clip-picker";
+import { ClipPicker, NewAnimatedBeatDialog } from "@/components/clip-picker";
+import { PreviewPlayer } from "@/components/preview-player";
 import { RenderPanel } from "@/components/render-panel";
 import {
   chosenCount,
@@ -26,8 +27,14 @@ export default function EditorPage() {
   const load = useEditorStore((s) => s.load);
   const stopPolling = useEditorStore((s) => s.stopPolling);
   const render = useEditorStore((s) => s.render);
+  const toggleBeat = useEditorStore((s) => s.toggleBeat);
+  const setAllBeatsIncluded = useEditorStore((s) => s.setAllBeatsIncluded);
+  const editBeatText = useEditorStore((s) => s.editBeatText);
 
   const [pickerBeat, setPickerBeat] = React.useState<number | null>(null);
+  const [insertPosition, setInsertPosition] = React.useState<number | null>(null);
+  // Beat being auditioned on its own via the per-row play button (null = closed).
+  const [previewBeat, setPreviewBeat] = React.useState<number | null>(null);
   // Lets the user step back from a finished render to keep editing (ephemeral —
   // a refresh re-derives the phase from the job, landing back on the result).
   const [editingAfterDone, setEditingAfterDone] = React.useState(false);
@@ -52,6 +59,13 @@ export default function EditorPage() {
   const openPicker = React.useCallback((beatIndex: number) => {
     setPickerBeat(beatIndex);
   }, []);
+  const playBeat = React.useCallback((beatIndex: number) => {
+    setPreviewBeat(beatIndex);
+  }, []);
+  const onEditText = React.useCallback(
+    (beatIndex: number, text: string) => editBeatText(beatIndex, text),
+    [editBeatText],
+  );
 
   // The narration filename isn't carried across the upload navigation, so the
   // upload screen stashes it in sessionStorage keyed by job id.
@@ -123,6 +137,11 @@ export default function EditorPage() {
             stage={job.stage}
             locked={showRender}
             onOpenPicker={openPicker}
+            onToggleIncluded={toggleBeat}
+            onSetAllIncluded={setAllBeatsIncluded}
+            onPlayBeat={playBeat}
+            onAddTextBeat={setInsertPosition}
+            onEditText={onEditText}
           />
         </div>
         {showRender ? (
@@ -141,6 +160,21 @@ export default function EditorPage() {
         beat={openBeat}
         open={pickerBeat !== null && !showRender}
         onClose={() => setPickerBeat(null)}
+      />
+
+      <NewAnimatedBeatDialog
+        key={insertPosition ?? "insert-closed"}
+        position={insertPosition}
+        open={insertPosition !== null && !showRender}
+        onClose={() => setInsertPosition(null)}
+      />
+
+      <PreviewPlayer
+        key={previewBeat ?? "preview-closed"}
+        job={job}
+        beatIndex={previewBeat}
+        open={previewBeat !== null}
+        onClose={() => setPreviewBeat(null)}
       />
     </div>
   );

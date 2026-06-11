@@ -51,8 +51,10 @@ export function TopBar({
   const isDesktop = useIsDesktop();
   const { me } = useMe();
   // Gate rendering when the balance is exhausted; the cost is charged per render
-  // server-side, but a zero balance can never afford one.
-  const noCredits = me != null && me.credits <= 0;
+  // server-side, but a zero balance can never afford one. Tiers with unlimited
+  // credits (admin) are never gated.
+  const noCredits =
+    me != null && me.tier_info.unlimited_credits !== true && me.credits <= 0;
   return (
     <header className="sticky top-0 z-30 border-b border-hairline bg-canvas/85 backdrop-blur-xl">
       <div className="mx-auto flex max-w-7xl items-center gap-4 px-4 py-3 sm:px-6">

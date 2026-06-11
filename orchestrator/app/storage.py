@@ -119,6 +119,49 @@ def _upload_audio_b2_sync(settings: Settings, remote_name: str, local_path: Path
     bucket.upload_local_file(local_file=str(local_path), file_name=remote_name)
 
 
+def _beat_clip_remote_name(settings: Settings, job_id: str, slot: object, suffix: str) -> str:
+    prefix = settings.b2_prefix.strip("/")
+    name = f"beats/{job_id}/{slot}{suffix or '.webm'}"
+    return f"{prefix}/{name}" if prefix else name
+
+
+def _upload_object_b2_sync(settings: Settings, remote_name: str, local_path: Path) -> None:
+    bucket = _get_b2_bucket(
+        settings.b2_key_id,  # type: ignore[arg-type]
+        settings.b2_application_key,  # type: ignore[arg-type]
+        settings.b2_bucket_name,  # type: ignore[arg-type]
+    )
+    bucket.upload_local_file(local_file=str(local_path), file_name=remote_name)
+
+
+async def publish_beat_clip(
+    settings: Settings, job_id: str, slot: object, local_path: str
+) -> str:
+    """Persist a per-beat recorded clip and return a fetchable URL for the renderer.
+
+    ``slot`` is just the storage key segment (a beat index for per-beat overrides,
+    or a unique token for inserted cards so two inserts never collide).
+
+    Local mode: keep it on disk and return the absolute path (the renderer reads
+    non-http paths straight from disk). B2 mode: upload it and return a
+    long-lived download URL (presigned for private buckets), mirroring how a
+    user's uploaded source video is handled.
+    """
+
+    if settings.storage_local:
+        return str(local_path)
+    if not (settings.b2_key_id and settings.b2_application_key and settings.b2_bucket_name):
+        # No durable store configured — fall back to the local path so a purely
+        # local dev box still works even with storage_local mistakenly false.
+        return str(local_path)
+
+    suffix = Path(local_path).suffix or ".webm"
+    remote_name = _beat_clip_remote_name(settings, job_id, slot, suffix)
+    await _b2_call(settings, _upload_object_b2_sync, settings, remote_name, Path(local_path))
+    logger.info("persisted beat clip %s for job %s to B2 (%s)", slot, job_id, remote_name)
+    return await object_download_url(settings, remote_name)
+
+
 def _download_b2_object_sync(settings: Settings, remote_name: str, local_path: Path) -> None:
     bucket = _get_b2_bucket(
         settings.b2_key_id,  # type: ignore[arg-type]

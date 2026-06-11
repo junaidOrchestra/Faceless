@@ -112,6 +112,31 @@ class RenderRequest(BaseModel):
         default=None,
         description="Override whether per-beat narration captions are burned in.",
     )
+    excluded_beats: list[int] | None = Field(
+        default=None,
+        examples=[[2, 5]],
+        description=(
+            "Beat indices to drop from the render. Excluded beats are removed "
+            "from both the visual timeline and the narration audio; remaining "
+            "beats stitch together contiguously into a shorter video. Omit to "
+            "keep any exclusions stored from a prior render request."
+        ),
+    )
+    remove_silence: bool | None = Field(
+        default=None,
+        description=(
+            "Tighten audio: cut detected silences/pauses (and inter-beat dead "
+            "air) from the narration so the video plays without gaps. Omit to "
+            "keep the value stored from a prior render request."
+        ),
+    )
+    remove_fillers: bool | None = Field(
+        default=None,
+        description=(
+            "Tighten audio: cut filler/hesitation words ('um', 'uh', 'hmm', …) "
+            "flagged during transcription. Omit to keep the stored value."
+        ),
+    )
 
 
 class VideoStatusResponse(BaseModel):
@@ -138,7 +163,14 @@ class BeatAssignmentOut(BaseModel):
 
 
 class BeatCandidateOut(BaseModel):
-    """One ranked option for a beat (the default plus alternates the user can pick)."""
+    """One ranked option for a beat (the default plus alternates the user can pick).
+
+    Tolerates extra keys (``extra="ignore"``): candidates stored for special
+    visuals (e.g. an animated text card) carry extra metadata in their JSONB that
+    isn't part of this wire shape.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
     platform: str | None = None
     kind: str | None = None
@@ -147,6 +179,37 @@ class BeatCandidateOut(BaseModel):
     score: float | None = None
     attribution: str | None = None
     selected: bool = False
+
+
+class BeatClipResponse(BaseModel):
+    """Result of uploading a per-beat recorded clip (e.g. an animated text card)."""
+
+    video_job_id: str
+    beat_index: int
+    candidate_index: int
+    media_url: str | None = None
+
+
+class BeatInsertResponse(BaseModel):
+    """Result of inserting a standalone animated text-card beat.
+
+    Existing beats at/after ``beat_index`` were shifted up by one, so the client
+    should re-fetch the beats list. ``duration_s`` is the card's on-screen length.
+    """
+
+    video_job_id: str
+    beat_index: int
+    duration_s: float
+    media_url: str | None = None
+
+
+class WordOut(BaseModel):
+    """One transcribed word with timing and a filler flag (compact wire shape)."""
+
+    t: str  # text
+    s: float  # start_s
+    e: float  # end_s
+    f: bool = False  # is_filler
 
 
 class BeatOut(BaseModel):
@@ -160,11 +223,50 @@ class BeatOut(BaseModel):
     assignment: BeatAssignmentOut | None = None
     # Up to 3 options (selected first, then alternates), each with preview + media URL.
     candidates: list[BeatCandidateOut] = Field(default_factory=list)
+    # Per-word timing + filler flags (empty for jobs transcribed before this
+    # existed). Powers filler-word strike-through and the "tighten audio" preview.
+    words: list[WordOut] = Field(default_factory=list)
+    # Beat origin: "narration" (transcript window) or "insert" (a user-added
+    # standalone animated text card with no narration). Inserts last ``duration_s``
+    # seconds and contribute a silent gap to the audio track.
+    kind: str = "narration"
+    duration_s: float | None = None
 
 
 class BeatsResponse(BaseModel):
     video_job_id: str
     beats: list[BeatOut] = Field(default_factory=list)
+    # Detected silence/pause spans across the whole narration ([start_s, end_s]),
+    # so the editor can preview how much "remove silences" would shave off.
+    silence_spans: list[list[float]] = Field(default_factory=list)
+
+
+class BeatTextUpdate(BaseModel):
+    """Correct the transcript text of one beat — a transcription typo fix.
+
+    The word was spoken correctly, just transcribed wrong, so ONLY the displayed/
+    burned caption text changes. Timing, audio, clips, exclusions, and billing are
+    untouched. When the corrected text has the same number of whitespace-separated
+    tokens as the beat's stored per-word timing, those words are re-synced in place
+    (timings + filler flags preserved) so the word-level caption stays consistent.
+    """
+
+    text: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="Corrected beat text.",
+        examples=["They sailed past the cape at dawn."],
+    )
+
+
+class BeatTextResponse(BaseModel):
+    """Result of correcting a beat's transcript text."""
+
+    video_job_id: str
+    beat_index: int
+    text: str
+    words: list[WordOut] = Field(default_factory=list)
 
 
 class TierInfo(BaseModel):
@@ -176,7 +278,42 @@ class TierInfo(BaseModel):
     max_video_seconds: int
     max_resolution_height: int
     watermark: bool
+    unlimited_credits: bool = False
     features: list[str] = Field(default_factory=list)
+
+
+FeedbackCategory = Literal["suggestion", "improvement", "bug", "praise", "other"]
+
+
+class FeedbackRequest(BaseModel):
+    """A user-submitted note. Only ``category`` + ``message`` are required."""
+
+    category: FeedbackCategory = "suggestion"
+    message: str = Field(
+        ...,
+        min_length=3,
+        max_length=4000,
+        description="The user's suggestion / improvement / bug report.",
+        examples=["A timeline scrubber on the pick-clips screen would be amazing."],
+    )
+    rating: int | None = Field(
+        default=None, ge=1, le=5, description="Optional 1-5 satisfaction signal."
+    )
+    email: str | None = Field(
+        default=None,
+        max_length=320,
+        description="Optional reply-to (defaults to the account email).",
+    )
+    page: str | None = Field(
+        default=None, max_length=512, description="Page/path the user was on."
+    )
+
+
+class FeedbackResponse(BaseModel):
+    """Acknowledgement returned after a feedback row is stored."""
+
+    id: int
+    status: Literal["received"] = "received"
 
 
 class MeResponse(BaseModel):

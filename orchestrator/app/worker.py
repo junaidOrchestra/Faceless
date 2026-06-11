@@ -159,7 +159,7 @@ class PipelineWorkers:
         sessionmaker = get_sessionmaker()
         while not self._stop.is_set():
             try:
-                job_id = await queue.claim(self._settings.worker_poll_interval_s)
+                job_id = await queue.claim(self._settings.worker_queue_block_timeout_s)
                 if job_id is None:
                     continue
                 try:
@@ -327,7 +327,10 @@ class PipelineWorkers:
                 # we were transcribing).
                 await session.refresh(job)
                 if (job.payload or {}).get("prepared"):
-                    await job_queue.llm_queue.enqueue(job_id)
+                    # Idempotent: POST /prepare may also be enqueueing this exact
+                    # job right now (it re-reads status after flipping `prepared`).
+                    # The SET NX guard ensures the clip search is dispatched once.
+                    await job_queue.llm_queue.enqueue_once(job_id)
                 else:
                     logger.info(
                         "job %s transcribed; awaiting /prepare before clip search", job_id
@@ -533,7 +536,7 @@ class PipelineWorkers:
         last_backstop = time.monotonic()
         while not self._stop.is_set():
             try:
-                raw = await queue.claim(self._settings.worker_poll_interval_s)
+                raw = await queue.claim(self._settings.worker_queue_block_timeout_s)
                 if raw is not None:
                     try:
                         await self._handle_clip_result(sessionmaker, raw)

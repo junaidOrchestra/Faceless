@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Brollio</string>
+    <string name="title_activity_main">Brollio</string>
+    <string name="package_name">com.brollio.app</string>
+    <string name="custom_url_scheme">com.brollio.app</string>
+</resources>

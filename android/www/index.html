@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Brollio</title>
+    <style>
+      :root { color-scheme: dark; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #0b0b0d;
+        color: #f5f1e8;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      .wrap {
+        display: grid;
+        place-items: center;
+        height: 100%;
+        text-align: center;
+        padding: 24px;
+        box-sizing: border-box;
+      }
+      h1 { font-size: 1.5rem; margin: 0 0 8px; }
+      p { color: #a39e92; max-width: 28ch; line-height: 1.5; margin: 0; }
+      .spinner {
+        margin-bottom: 20px;
+        width: 38px; height: 38px;
+        border: 3px solid rgba(255,255,255,0.15);
+        border-top-color: #e8b339;
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <!-- Fallback page. The app normally loads the hosted web app via
+         capacitor.config.ts `server.url`; this is shown only if that can't be
+         reached (e.g. offline or a misconfigured URL). -->
+    <div class="wrap">
+      <div>
+        <div class="spinner"></div>
+        <h1>Brollio</h1>
+        <p>Couldn’t reach Brollio. Check your connection and try again.</p>
+      </div>
+    </div>
+  </body>
+</html>

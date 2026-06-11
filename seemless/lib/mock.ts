@@ -86,6 +86,7 @@ export function makeMockBase(id: string, fileName = "narration.mp3"): VideoJob {
       visualType: b.visualType,
       overlay: b.visualType === "text_card" ? b.text.slice(0, 60) : undefined,
       loading: false,
+      included: true,
       // Pre-select the top candidate so the user reviews instead of starting blank.
       chosenAssetId: candidates.length === 0 ? null : candidates[0].id,
       candidates,
@@ -102,6 +103,8 @@ export function makeMockBase(id: string, fileName = "narration.mp3"): VideoJob {
     quality: "standard",
     captions: true,
     music: false,
+    removeSilence: false,
+    removeFillers: false,
     theme: { mode: "script" },
     fileName,
     durationSec: Math.round(cursor),

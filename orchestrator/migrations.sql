@@ -10,7 +10,9 @@ CREATE TABLE IF NOT EXISTS users (
     stripe_customer_id  TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT users_tier_check CHECK (tier IN ('free', 'individual', 'professional'))
+    -- 'admin' is an internal-only tier (not advertised); assign it by updating
+    -- the row directly. Unlimited credits/length but watermark stays on.
+    CONSTRAINT users_tier_check CHECK (tier IN ('free', 'individual', 'professional', 'admin'))
 );
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -45,6 +47,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_credit_tx_refund_per_project
     ON credit_transactions (project_id)
     WHERE reason = 'refund' AND project_id IS NOT NULL;
 
+-- Append-only user feedback (suggestions, improvements, bugs, praise).
+CREATE TABLE IF NOT EXISTS feedback (
+    id          BIGSERIAL PRIMARY KEY,
+    user_id     VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    category    VARCHAR(32) NOT NULL DEFAULT 'suggestion',
+    message     TEXT NOT NULL,
+    rating      INTEGER,
+    email       TEXT,
+    page        TEXT,
+    user_agent  TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT feedback_category_check CHECK (
+        category IN ('suggestion', 'improvement', 'bug', 'praise', 'other')
+    ),
+    CONSTRAINT feedback_rating_check CHECK (rating IS NULL OR rating BETWEEN 1 AND 5)
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_feedback_recent ON feedback (created_at DESC);
+
 CREATE TABLE IF NOT EXISTS video_jobs (
     id VARCHAR(128) PRIMARY KEY,
     user_id VARCHAR(128) NOT NULL,
@@ -75,6 +97,11 @@ CREATE TABLE IF NOT EXISTS beats (
     start_s DOUBLE PRECISION NOT NULL,
     end_s DOUBLE PRECISION NOT NULL,
     queries JSONB,
+    words JSONB,
+    -- "narration" (transcript beat) or "insert" (user-added standalone animated
+    -- text card with no narration; duration_s seconds of video + a silent gap).
+    kind VARCHAR(16) NOT NULL DEFAULT 'narration',
+    duration_s DOUBLE PRECISION,
     PRIMARY KEY (video_job_id, index)
 );
 

@@ -1,11 +1,25 @@
 "use client";
 
-import { AlertTriangle, AudioLines, Loader2, Sparkles } from "lucide-react";
+import * as React from "react";
+import {
+  AlertTriangle,
+  AudioLines,
+  CheckSquare,
+  Loader2,
+  Plus,
+  Search,
+  Sparkles,
+  Square,
+  X,
+} from "lucide-react";
 import { BeatRow } from "@/components/beat-row";
 import { SetupCard } from "@/components/setup-card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { Beat, VideoJob } from "@/lib/types";
-import type { JobPhase } from "@/lib/store";
+import type { VideoJob } from "@/lib/types";
+import { keptBeats, type JobPhase } from "@/lib/store";
+import { friendlyError } from "@/lib/errors";
 
 function GhostRows({ count = 6 }: { count?: number }) {
   return (
@@ -72,20 +86,64 @@ function PreparingState({ stage, slow }: { stage: string; slow?: boolean }) {
   );
 }
 
+function AddTextBeatButton({
+  position,
+  onAdd,
+}: {
+  position: number;
+  onAdd?: (position: number) => void;
+}) {
+  if (!onAdd) return null;
+  return (
+    <li className="flex justify-center py-1">
+      <Button
+        type="button"
+        size="sm"
+        variant="ghost"
+        className="border border-dashed border-hairline/80 bg-panel-raised/30 text-faint hover:text-cream"
+        onClick={() => onAdd(position)}
+      >
+        <Plus className="size-3.5" />
+        Add text card
+      </Button>
+    </li>
+  );
+}
+
 export function Storyboard({
   job,
   phase,
   stage,
   locked = false,
   onOpenPicker,
+  onToggleIncluded,
+  onSetAllIncluded,
+  onPlayBeat,
+  onAddTextBeat,
+  onEditText,
 }: {
   job: VideoJob;
   phase: JobPhase;
   stage: string;
   locked?: boolean;
   onOpenPicker: (beatIndex: number) => void;
+  onToggleIncluded?: (beatIndex: number) => void;
+  onSetAllIncluded?: (included: boolean) => void;
+  onPlayBeat?: (beatIndex: number) => void;
+  onAddTextBeat?: (position: number) => void;
+  onEditText?: (beatIndex: number, text: string) => void | Promise<void>;
 }) {
   const beats = job.beats;
+  const kept = keptBeats(job);
+  const [query, setQuery] = React.useState("");
+
+  const trimmedQuery = query.trim().toLowerCase();
+  const visibleBeats = React.useMemo(() => {
+    if (!trimmedQuery) return beats;
+    return beats.filter((b) =>
+      `${b.text} ${b.overlay ?? ""}`.toLowerCase().includes(trimmedQuery),
+    );
+  }, [beats, trimmedQuery]);
 
   if (phase === "failed") {
     return (
@@ -94,9 +152,12 @@ export function Storyboard({
         <div className="panel flex items-start gap-3 border-destructive/40 p-4">
           <AlertTriangle className="mt-0.5 size-5 shrink-0 text-destructive" />
           <div>
-            <p className="text-sm font-medium text-cream">Processing failed</p>
+            <p className="text-sm font-medium text-cream">Something broke</p>
             <p className="text-xs text-faint">
-              {job.error || stage || "The pipeline could not finish this job."}
+              {friendlyError(
+                job.error,
+                "We couldn't finish processing this video. Our team's been notified — please try again.",
+              )}
             </p>
           </div>
         </div>
@@ -125,12 +186,14 @@ export function Storyboard({
         ) : (
           <span className="text-xs text-faint">
             {locked
-              ? `${beats.length} beats · view only`
+              ? `${kept.length} of ${beats.length} beats · view only`
               : setup
                 ? hasBeats
-                  ? `${beats.length} beats · review`
+                  ? `${kept.length} of ${beats.length} beats · review`
                   : "transcribing…"
-                : `${beats.length} beats`}
+                : kept.length < beats.length
+                  ? `${kept.length} of ${beats.length} beats`
+                  : `${beats.length} beats`}
           </span>
         )}
       </div>
@@ -139,19 +202,99 @@ export function Storyboard({
 
       {setup && <SetupCard job={job} transcribing={!hasBeats} />}
 
+      {!locked && hasBeats && onSetAllIncluded && (
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-hairline bg-panel-raised/40 px-3 py-2">
+          <p className="text-xs text-faint">
+            Tick the beats to keep.{" "}
+            <span className="font-medium text-cream">{kept.length}</span> of {beats.length} in
+            your video
+          </p>
+          <div className="flex items-center gap-1">
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => onSetAllIncluded(true)}
+              disabled={kept.length === beats.length}
+            >
+              <CheckSquare className="size-3.5" />
+              Select all
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => onSetAllIncluded(false)}
+              disabled={kept.length === 0}
+            >
+              <Square className="size-3.5" />
+              Deselect all
+            </Button>
+          </div>
+        </div>
+      )}
+
       {hasBeats ? (
-        <ol className="space-y-3">
-          {beats.map((beat) => (
-            <BeatRow
-              key={beat.index}
-              beat={beat}
-              index={beat.index}
-              searching={searching}
-              locked={locked}
-              onOpenPicker={onOpenPicker}
+        <>
+          <div className="relative mb-3">
+            <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-faint" />
+            <Input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search beats by text…"
+              aria-label="Search beats"
+              className="pl-9 pr-9"
             />
-          ))}
-        </ol>
+            {query && (
+              <button
+                type="button"
+                onClick={() => setQuery("")}
+                aria-label="Clear search"
+                className="absolute right-2 top-1/2 grid size-6 -translate-y-1/2 place-items-center rounded-md text-faint hover:bg-panel-raised hover:text-cream"
+              >
+                <X className="size-4" />
+              </button>
+            )}
+          </div>
+
+          {visibleBeats.length > 0 ? (
+            <div className="-mr-1 max-h-[65vh] overflow-y-auto pr-1 lg:max-h-[calc(100vh-200px)]">
+              <ol className="space-y-3">
+                {!locked && !trimmedQuery && !searching && (
+                  <AddTextBeatButton position={0} onAdd={onAddTextBeat} />
+                )}
+                {visibleBeats.map((beat) => (
+                  <React.Fragment key={beat.index}>
+                    <BeatRow
+                      beat={beat}
+                      index={beat.index}
+                      searching={searching}
+                      locked={locked}
+                      strikeFillers={job.removeFillers}
+                      onOpenPicker={onOpenPicker}
+                      onToggleIncluded={onToggleIncluded}
+                      onPlayBeat={onPlayBeat}
+                      onEditText={onEditText}
+                    />
+                    {!locked && !trimmedQuery && !searching && (
+                      <AddTextBeatButton position={beat.index + 1} onAdd={onAddTextBeat} />
+                    )}
+                  </React.Fragment>
+                ))}
+              </ol>
+            </div>
+          ) : (
+            <div className="panel flex flex-col items-center gap-1 p-8 text-center">
+              <p className="text-sm font-medium text-cream">No beats match “{query}”</p>
+              <button
+                type="button"
+                onClick={() => setQuery("")}
+                className="text-xs font-medium text-accent hover:underline"
+              >
+                Clear search
+              </button>
+            </div>
+          )}
+        </>
       ) : (
         // Setup is committed-or-pending but beats haven't arrived. Show the
         // background transcription progress beneath the form.

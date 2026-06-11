@@ -9,6 +9,7 @@ import { CreditBadge } from "@/components/account/credit-badge";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { friendlyError } from "@/lib/errors";
 
 type Project = {
   id: string;
@@ -169,7 +170,7 @@ export default function ProjectsPage() {
               )}
               {p.status === "failed" && (
                 <p className="rounded-md bg-red-500/10 px-2.5 py-1.5 text-xs text-red-400">
-                  {p.error || "Processing failed. Please try again."}
+                  {friendlyError(p.error, "Something broke while processing this video. Please try again.")}
                 </p>
               )}
               {confirmId === p.id ? (

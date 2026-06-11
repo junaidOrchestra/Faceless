@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { Zap } from "lucide-react";
+import { Skeleton } from "@/components/ui/skeleton";
 import { useMe } from "@/lib/use-me";
 import { cn } from "@/lib/utils";
 
@@ -12,9 +13,15 @@ import { cn } from "@/lib/utils";
 export function CreditBadge({ className }: { className?: string }) {
   const { me, loading } = useMe();
 
-  if (loading || !me) return null;
+  // Skeleton while loading keeps the header height stable (no pop-in); once
+  // resolved, a guest (no account) renders nothing.
+  if (loading) {
+    return <Skeleton className={cn("h-[26px] w-[88px] rounded-full", className)} />;
+  }
+  if (!me) return null;
 
-  const empty = me.credits <= 0;
+  const unlimited = me.tier_info.unlimited_credits === true;
+  const empty = !unlimited && me.credits <= 0;
 
   return (
     <Link
@@ -26,10 +33,14 @@ export function CreditBadge({ className }: { className?: string }) {
           : "border-hairline bg-panel text-cream hover:border-hairline/80",
         className,
       )}
-      title={`${me.tier_info.label} plan · ${me.credits} credits`}
+      title={
+        unlimited
+          ? `${me.tier_info.label} plan · unlimited credits`
+          : `${me.tier_info.label} plan · ${me.credits} credits`
+      }
     >
       <Zap className={cn("size-3.5", empty ? "text-accent" : "text-accent")} />
-      {empty ? "Upgrade" : `${me.credits} credits`}
+      {unlimited ? "Unlimited" : empty ? "Upgrade" : `${me.credits} credits`}
     </Link>
   );
 }

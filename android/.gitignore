@@ -1,0 +1,18 @@
+# Capacitor wrapper — Node
+node_modules/
+package-lock.json.bak
+
+# Capacitor build/sync artifacts
+.DS_Store
+
+# Native Android build outputs (the android/ project keeps its own .gitignore too)
+android/app/build/
+android/build/
+android/.gradle/
+android/captures/
+android/local.properties
+android/.idea/
+*.apk
+*.aab
+*.keystore
+!debug.keystore

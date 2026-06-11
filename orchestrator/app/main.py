@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import mimetypes
 import uuid
@@ -30,12 +31,18 @@ from .renderer.factory import build_renderer
 from .schemas import (
     BeatAssignmentOut,
     BeatCandidateOut,
+    BeatClipResponse,
+    BeatInsertResponse,
     BeatOut,
     BeatsResponse,
+    BeatTextResponse,
+    BeatTextUpdate,
     CreateVideoResponse,
     CreditsResponse,
     CreditTransactionOut,
     ErrorResponse,
+    FeedbackRequest,
+    FeedbackResponse,
     HealthResponse,
     MeResponse,
     PrepareRequest,
@@ -45,8 +52,10 @@ from .schemas import (
     TierInfo,
     VideoCredentials,
     VideoStatusResponse,
+    WordOut,
 )
 from .services import credits as credit_service
+from .services import feedback as feedback_service
 from .services import projects as project_service
 from .services import users as user_service
 from .services import video_jobs as job_service
@@ -532,10 +541,276 @@ async def get_video_beats(
             ]
             if assignment is not None
             else [],
+            words=[WordOut(**w) for w in (beat.words or []) if isinstance(w, dict)],
+            kind=beat.kind or "narration",
+            duration_s=beat.duration_s,
         )
         for beat, assignment in rows
     ]
-    return BeatsResponse(video_job_id=video_job_id, beats=beats)
+    silence_spans = [
+        [float(s[0]), float(s[1])]
+        for s in ((job.payload or {}).get("silence_spans") or [])
+        if isinstance(s, (list, tuple)) and len(s) == 2
+    ]
+    return BeatsResponse(
+        video_job_id=video_job_id, beats=beats, silence_spans=silence_spans
+    )
+
+
+@app.patch(
+    "/videos/{video_job_id}/beats/{beat_index}/text",
+    response_model=BeatTextResponse,
+    tags=["videos"],
+    summary="Correct a beat's transcript text (typo fix)",
+    description=(
+        "Fixes a mis-transcribed word: the speech was correct, just transcribed "
+        "wrong. ONLY the beat's caption text changes (re-synced onto the existing "
+        "per-word timing when the word count is unchanged). Audio, timing, clip "
+        "choices, exclusions, and billing are untouched. Re-render to burn the "
+        "corrected captions into the MP4."
+    ),
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+    },
+)
+async def update_beat_text(
+    video_job_id: str,
+    beat_index: int,
+    payload: BeatTextUpdate,
+    session: SessionDep,
+    settings: SettingsDep,
+    user: CurrentUserDep,
+) -> BeatTextResponse:
+    await enforce_rate_limit(settings, bucket="beat_text", identity=user.id, limit=120)
+    job = await job_service.get_owned_video_job(session, video_job_id, user.id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown video_job_id.")
+    if job.status == "rendering":
+        raise HTTPException(
+            status_code=409, detail="Cannot edit text while the video is rendering."
+        )
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Beat text must not be empty.")
+    beat = await job_service.update_beat_text(session, video_job_id, beat_index, text)
+    if beat is None:
+        raise HTTPException(status_code=404, detail="Unknown beat_index.")
+    logger.info("corrected text for job %s beat %s", video_job_id, beat_index)
+    return BeatTextResponse(
+        video_job_id=video_job_id,
+        beat_index=beat_index,
+        text=beat.text,
+        words=[WordOut(**w) for w in (beat.words or []) if isinstance(w, dict)],
+    )
+
+
+# Recorded per-beat clips (e.g. an animated text card) are short WebM/MP4 files.
+_BEAT_CLIP_VIDEO = {"video/webm", "video/mp4"}
+
+
+@app.post(
+    "/videos/{video_job_id}/beats/{beat_index}/clip",
+    response_model=BeatClipResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["videos"],
+    summary="Upload a recorded clip for one beat (e.g. an animated text card)",
+    description=(
+        "Stores a browser-recorded clip (WebM/MP4) and registers it as a selected "
+        "candidate for the beat, so the render uses it as that beat's footage. The "
+        "returned candidate_index can be echoed back in RenderRequest.overrides."
+    ),
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+    },
+)
+async def upload_beat_clip(
+    video_job_id: str,
+    beat_index: int,
+    session: SessionDep,
+    settings: SettingsDep,
+    user: CurrentUserDep,
+    clip: UploadFile = File(..., description="Recorded beat clip (WebM/MP4)."),
+    style: str | None = Form(default=None, description="Animated background style id."),
+    palette: str | None = Form(default=None, description="Animated palette id."),
+    sound: str | None = Form(default=None, description="Per-word sound id."),
+) -> BeatClipResponse:
+    await enforce_rate_limit(
+        settings, bucket="beat_clip", identity=user.id, limit=60
+    )
+    job = await job_service.get_owned_video_job(session, video_job_id, user.id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown video_job_id.")
+    if job.status == "rendering":
+        raise HTTPException(
+            status_code=409, detail="Cannot change clips while the video is rendering."
+        )
+    beat_count = await job_service.count_beats(session, video_job_id)
+    if not (0 <= beat_index < beat_count):
+        raise HTTPException(status_code=404, detail="Unknown beat_index.")
+
+    raw_ct = (clip.content_type or "").split(";")[0].strip().lower()
+    if raw_ct and raw_ct not in _BEAT_CLIP_VIDEO:
+        raise HTTPException(status_code=400, detail="Beat clip must be WebM or MP4 video.")
+    ext = ".webm" if "webm" in raw_ct else ".mp4" if "mp4" in raw_ct else (
+        Path(clip.filename or "").suffix.lower() or ".webm"
+    )
+    work_dir = Path(settings.render_temp_dir) / "uploads" / video_job_id / "beats"
+    local = work_dir / f"beat_{beat_index}{ext}"
+    await _write_upload_stream(clip, local, settings.max_upload_bytes)
+    # The clip is generated by us (animated text card); just confirm it's a
+    # decodable container. Don't require an audio stream — the "none" sound still
+    # records a (silent) track, but we don't want a probe quirk to reject it.
+    try:
+        await media_validation.validate_media_file(
+            local, probe_timeout_s=settings.media_probe_timeout_s, require_audio=False
+        )
+    except media_validation.MediaValidationError as exc:
+        local.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    media_url = await storage.publish_beat_clip(settings, video_job_id, beat_index, str(local))
+    candidate = {
+        "platform": "animated_text",
+        "kind": "video",
+        "media_url": media_url,
+        # No still poster (the clip is the preview); the editor plays the video.
+        "preview_url": media_url,
+        "score": 1.0,
+        "attribution": "Animated text",
+        "animated": {"style": style, "palette": palette, "sound": sound},
+    }
+    candidate_index = await job_service.add_or_select_beat_candidate(
+        session, video_job_id, beat_index, candidate
+    )
+    logger.info(
+        "stored animated clip for job %s beat %s (candidate %s, style=%s sound=%s)",
+        video_job_id,
+        beat_index,
+        candidate_index,
+        style,
+        sound,
+    )
+    return BeatClipResponse(
+        video_job_id=video_job_id,
+        beat_index=beat_index,
+        candidate_index=candidate_index,
+        media_url=media_url,
+    )
+
+
+@app.post(
+    "/videos/{video_job_id}/beats/insert",
+    response_model=BeatInsertResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["videos"],
+    summary="Insert a new standalone animated text-card beat",
+    description=(
+        "Adds a brand-new beat at ``position`` (existing beats at/after it shift up "
+        "by one). The beat has NO narration: it lasts ``duration_s`` seconds and "
+        "splices an equal silent gap into the final audio, while its recorded clip "
+        "(with per-word typing SFX) plays as the visual. Re-fetch the beats list "
+        "afterwards, since indices have changed."
+    ),
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+    },
+)
+async def insert_animated_beat(
+    video_job_id: str,
+    session: SessionDep,
+    settings: SettingsDep,
+    user: CurrentUserDep,
+    clip: UploadFile = File(..., description="Recorded animated text-card clip (WebM/MP4)."),
+    position: int = Form(..., description="Insert index (0..beat_count)."),
+    text: str = Form(..., description="The card's text."),
+    duration_s: float = Form(..., description="On-screen / silent-gap duration in seconds."),
+    style: str | None = Form(default=None, description="Animated background style id."),
+    palette: str | None = Form(default=None, description="Animated palette id."),
+    sound: str | None = Form(default=None, description="Per-word sound id."),
+    words: str | None = Form(default=None, description="JSON [{t,s,e,f}] per-word timing (optional)."),
+) -> BeatInsertResponse:
+    await enforce_rate_limit(settings, bucket="beat_insert", identity=user.id, limit=60)
+    job = await job_service.get_owned_video_job(session, video_job_id, user.id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown video_job_id.")
+    if job.status == "rendering":
+        raise HTTPException(
+            status_code=409, detail="Cannot add beats while the video is rendering."
+        )
+    text = (text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Card text must not be empty.")
+    if not (0.2 <= duration_s <= 120.0):
+        raise HTTPException(status_code=400, detail="duration_s must be between 0.2 and 120.")
+
+    parsed_words: list[dict] | None = None
+    if words:
+        try:
+            loaded = json.loads(words)
+            if isinstance(loaded, list):
+                parsed_words = [w for w in loaded if isinstance(w, dict)]
+        except (ValueError, TypeError):
+            parsed_words = None
+
+    raw_ct = (clip.content_type or "").split(";")[0].strip().lower()
+    if raw_ct and raw_ct not in _BEAT_CLIP_VIDEO:
+        raise HTTPException(status_code=400, detail="Beat clip must be WebM or MP4 video.")
+    ext = ".webm" if "webm" in raw_ct else ".mp4" if "mp4" in raw_ct else (
+        Path(clip.filename or "").suffix.lower() or ".webm"
+    )
+    # Unique token so two inserts (or an insert at a shifting index) never reuse a
+    # storage path; the DB beat index is reassigned by the service.
+    slot = f"ins-{uuid.uuid4().hex[:12]}"
+    work_dir = Path(settings.render_temp_dir) / "uploads" / video_job_id / "beats"
+    local = work_dir / f"{slot}{ext}"
+    await _write_upload_stream(clip, local, settings.max_upload_bytes)
+    try:
+        await media_validation.validate_media_file(
+            local, probe_timeout_s=settings.media_probe_timeout_s, require_audio=False
+        )
+    except media_validation.MediaValidationError as exc:
+        local.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    media_url = await storage.publish_beat_clip(settings, video_job_id, slot, str(local))
+    candidate = {
+        "platform": "animated_text",
+        "kind": "video",
+        "media_url": media_url,
+        "preview_url": media_url,
+        "score": 1.0,
+        "attribution": "Animated text",
+        "animated": {"style": style, "palette": palette, "sound": sound},
+    }
+    beat_index = await job_service.insert_animated_beat(
+        session,
+        video_job_id,
+        position=position,
+        text=text,
+        duration_s=float(duration_s),
+        words=parsed_words,
+        candidate=candidate,
+    )
+    logger.info(
+        "inserted animated beat for job %s at index %s (%.2fs, style=%s sound=%s)",
+        video_job_id,
+        beat_index,
+        duration_s,
+        style,
+        sound,
+    )
+    return BeatInsertResponse(
+        video_job_id=video_job_id,
+        beat_index=beat_index,
+        duration_s=float(duration_s),
+        media_url=media_url,
+    )
 
 
 # Statuses at which a job is still waiting for its output shape before the clip
@@ -627,8 +902,17 @@ async def prepare_video(
     # If transcription already finished, kick off the clip search now; otherwise
     # the transcribe worker will enqueue it when beats are ready (it re-reads the
     # prepared flag on completion).
+    #
+    # Re-read status FRESH after committing `prepared`: the worker may have just
+    # advanced the job to `transcribed` and already checked `prepared` (seeing it
+    # still false) between when we loaded the job above and now. Without this
+    # re-read we'd trust the stale in-memory status, skip the enqueue, and the
+    # job would hang in `transcribed` forever (the worker won't retry). The
+    # `enqueue_once` guard dedups against the worker so the search starts exactly
+    # once even when both sides fire.
+    await session.refresh(job)
     if job.status == "transcribed":
-        await job_queue.llm_queue.enqueue(video_job_id)
+        await job_queue.llm_queue.enqueue_once(video_job_id)
 
     return VideoStatusResponse(
         video_job_id=video_job_id,
@@ -697,15 +981,18 @@ async def render_video(
         )
         logger.info("render %s: applied %s candidate override(s)", video_job_id, changed)
 
+    excluded_beats: set[int] = set((job.payload or {}).get("excluded_beats") or [])
+
     # Final output shape can also change at render time (e.g. the user switched
     # aspect/captions on the Pick Clips screen after clip search ran). Fold those
     # into the stored payload that stage_render reads. The fetched stock media's
     # orientation was fixed at clip-search time, so this only changes the encoded
     # output dimensions (renderer cover-scales/crops), not which clips were used.
-    if body and (body.format is not None or body.subtitles is not None):
+    payload_dirty = False
+    payload = dict(job.payload or {})
+    if body is not None:
         from .formats import resolve_format
 
-        payload = dict(job.payload or {})
         if body.format is not None:
             try:
                 fmt = resolve_format(body.format)
@@ -717,19 +1004,61 @@ async def render_video(
                 "width": fmt.width,
                 "height": fmt.height,
             }
+            payload_dirty = True
         if body.subtitles is not None:
             payload["subtitles"] = bool(body.subtitles)
+            payload_dirty = True
+        if body.excluded_beats is not None:
+            excluded_beats = set(body.excluded_beats)
+            if excluded_beats:
+                beat_count = await job_service.count_beats(session, video_job_id)
+                if beat_count <= len(excluded_beats):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="At least one beat must be included in the render.",
+                    )
+                payload["excluded_beats"] = sorted(excluded_beats)
+            else:
+                payload.pop("excluded_beats", None)
+            payload_dirty = True
+        if body.remove_silence is not None:
+            payload["remove_silence"] = bool(body.remove_silence)
+            payload_dirty = True
+        if body.remove_fillers is not None:
+            payload["remove_fillers"] = bool(body.remove_fillers)
+            payload_dirty = True
+    if payload_dirty:
         await job_service.update_payload(session, video_job_id, payload)
         logger.info(
-            "render %s: output overrides format=%s subtitles=%s",
+            "render %s: payload overrides format=%s subtitles=%s excluded=%s "
+            "remove_silence=%s remove_fillers=%s",
             video_job_id,
-            body.format,
-            body.subtitles,
+            body.format if body else None,
+            body.subtitles if body else None,
+            sorted(excluded_beats) if excluded_beats else None,
+            payload.get("remove_silence"),
+            payload.get("remove_fillers"),
         )
 
     # --- Tier limits + credit cost (enforced BEFORE the job starts) ----------
+    # Bill by the tightened length the renderer will actually produce so removed
+    # silences/fillers/beats shorten the cost and tier-length check too.
+    remove_silence = bool(payload.get("remove_silence"))
+    remove_fillers = bool(payload.get("remove_fillers"))
+    silence_spans = [
+        (float(s[0]), float(s[1]))
+        for s in (payload.get("silence_spans") or [])
+        if isinstance(s, (list, tuple)) and len(s) == 2
+    ]
     original_status = job.status
-    duration_s = await job_service.get_job_duration_seconds(session, video_job_id)
+    duration_s = await job_service.get_render_duration_seconds(
+        session,
+        video_job_id,
+        excluded_beats,
+        silence_spans=silence_spans,
+        remove_silence=remove_silence,
+        remove_fillers=remove_fillers,
+    )
     me = await user_service.get_user(session, user.id)
     tier = me.tier if me else tiers.DEFAULT_TIER
 
@@ -737,10 +1066,13 @@ async def render_video(
     if violation is not None:
         raise HTTPException(status_code=400, detail=violation.message)
 
-    cost = tiers.credit_cost_for_seconds(duration_s)
+    # Internal tiers (admin) render for free: skip the credit pre-check and the
+    # deduction entirely so the balance is never the gate and never decremented.
+    unlimited_credits = tiers.get_tier_config(tier).unlimited_credits
+    cost = 0 if unlimited_credits else tiers.credit_cost_for_seconds(duration_s)
     # Friendly pre-check so an under-funded caller is rejected before we move the
     # job (the authoritative, atomic deduction happens only for the race winner).
-    if me is not None and me.credits < cost:
+    if me is not None and not unlimited_credits and me.credits < cost:
         raise HTTPException(
             status_code=402,
             detail=(
@@ -904,6 +1236,7 @@ def _tier_info(tier: str) -> TierInfo:
         max_video_seconds=cfg.max_video_seconds,
         max_resolution_height=cfg.max_resolution_height,
         watermark=cfg.watermark,
+        unlimited_credits=cfg.unlimited_credits,
         features=list(cfg.features),
     )
 
@@ -1038,6 +1371,49 @@ async def delete_project(
     # Storage cleanup is best-effort and never blocks the delete.
     await storage.delete_stored_objects(settings, project_id, audio_object)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.post(
+    "/feedback",
+    response_model=FeedbackResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["feedback"],
+    summary="Submit a suggestion, improvement, bug report, or note",
+    description=(
+        "Stores a feedback row from the authenticated user. Rate-limited per user. "
+        "Only category + message are required; rating/email are optional."
+    ),
+    responses={429: {"model": ErrorResponse}},
+)
+async def submit_feedback(
+    body: FeedbackRequest,
+    request: Request,
+    session: SessionDep,
+    settings: SettingsDep,
+    user: CurrentUserDep,
+) -> FeedbackResponse:
+    await enforce_rate_limit(
+        settings,
+        bucket="feedback",
+        identity=user.id,
+        limit=settings.rate_limit_feedback_per_min,
+    )
+    message = body.message.strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="Feedback message cannot be empty.")
+    row = await feedback_service.create_feedback(
+        session,
+        user_id=user.id,
+        category=body.category,
+        message=message,
+        rating=body.rating,
+        # Default the reply-to to the account email when the user didn't override.
+        email=body.email or user.email,
+        page=body.page,
+        user_agent=request.headers.get("user-agent"),
+    )
+    logger.info("feedback %s received from %s (%s)", row.id, user.id, body.category)
+    return FeedbackResponse(id=row.id)
 
 
 @app.get("/health", response_model=HealthResponse, tags=["health"], summary="Liveness probe")

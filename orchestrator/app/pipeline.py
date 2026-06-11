@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -37,9 +38,66 @@ from .formats import search_orientation
 from .llm.base import LLMProvider, Vocabulary
 from .renderer.base import Renderer, TimelineBeat
 from .services import video_jobs as job_service
-from .transcriber.base import BeatSegment, Transcriber
+from .timeline import BeatTiming, WordTiming, build_render_plan
+from .transcriber.base import Transcriber
 
 logger = logging.getLogger(__name__)
+
+# Silence detection (for the "remove silences/pauses" option). Tuned for spoken
+# narration: anything quieter than ``-30 dB`` for at least ``0.4s`` counts as a
+# pause worth cutting. Detection runs once at transcription; the render only
+# trims when the user turns the option on.
+_SILENCE_NOISE_DB = -30
+_SILENCE_MIN_DURATION_S = 0.4
+_SILENCE_START_RE = re.compile(r"silence_start:\s*([0-9.]+)")
+_SILENCE_END_RE = re.compile(r"silence_end:\s*([0-9.]+)")
+
+
+def _detect_silence(audio_path: str) -> list[list[float]]:
+    """Return ``[[start_s, end_s], …]`` silence spans via ffmpeg ``silencedetect``.
+
+    Parses the filter's stderr log lines. Any failure (missing ffmpeg, odd
+    output) returns an empty list so silence removal simply becomes a no-op
+    rather than failing transcription.
+    """
+
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-nostats",
+                "-i",
+                audio_path,
+                "-af",
+                f"silencedetect=noise={_SILENCE_NOISE_DB}dB:d={_SILENCE_MIN_DURATION_S}",
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+        logger.warning("silencedetect failed for %s: %s", audio_path, exc)
+        return []
+
+    log = proc.stderr or ""
+    spans: list[list[float]] = []
+    pending_start: float | None = None
+    for line in log.splitlines():
+        start_match = _SILENCE_START_RE.search(line)
+        if start_match:
+            pending_start = float(start_match.group(1))
+            continue
+        end_match = _SILENCE_END_RE.search(line)
+        if end_match and pending_start is not None:
+            end = float(end_match.group(1))
+            if end > pending_start:
+                spans.append([round(pending_start, 3), round(end, 3)])
+            pending_start = None
+    return spans
 
 
 def _clip_keywords(plan: Any, vocabulary: Vocabulary, *, limit: int = 3) -> list[str]:
@@ -110,35 +168,6 @@ def _probe_audio_duration(audio_path: str) -> float | None:
         return None
 
 
-def _clip_boundaries(
-    segments: list[BeatSegment], audio_duration_s: float | None
-) -> list[float]:
-    """Return ``len(segments)+1`` monotonic boundaries covering ``[0, audio_end]``.
-
-    The renderer concatenates clips back-to-back, so a clip's *duration* is what
-    decides how long an image stays on screen. To keep visuals in sync with the
-    narration and make the rendered length equal the audio length, the timeline
-    is GAPLESS: each image shows from its own beat's start until the NEXT beat
-    begins (absorbing inter-beat silence), and the last clip runs to the end of
-    the audio (covering lead-out silence). Mirrors faceless_lazy step5.
-    """
-
-    if not segments:
-        return [0.0, audio_duration_s or 3.0]
-
-    boundaries: list[float] = [0.0]
-    for seg in segments[1:]:
-        boundaries.append(float(seg.start_s))
-
-    last_end = audio_duration_s if audio_duration_s else segments[-1].end_s
-    boundaries.append(max(float(last_end), float(segments[-1].end_s)))
-
-    for i in range(1, len(boundaries)):
-        if boundaries[i] < boundaries[i - 1]:
-            boundaries[i] = boundaries[i - 1]
-    return boundaries
-
-
 def _asset_to_candidate(asset: ClipRankedAsset, *, selected: bool) -> dict[str, Any]:
     """Flatten a ranked asset into the candidate dict stored on the assignment."""
 
@@ -195,11 +224,36 @@ async def stage_transcribe(
     )
     segments = await transcriber.transcribe(audio_path)
     beats = [
-        {"index": s.index, "text": s.text, "start_s": s.start_s, "end_s": s.end_s}
+        {
+            "index": s.index,
+            "text": s.text,
+            "start_s": s.start_s,
+            "end_s": s.end_s,
+            "words": [
+                {"t": w.text, "s": w.start_s, "e": w.end_s, "f": w.is_filler}
+                for w in s.words
+            ],
+        }
         for s in segments
     ]
     await job_service.save_beats(session, job_id, beats)
-    logger.info("job %s transcribed into %s beats", job_id, len(beats))
+
+    # Detect silences once (acoustic) and stash on the payload so a later render
+    # can offer "remove silences/pauses" without re-analyzing the audio, and the
+    # editor can preview how much would be cut. Best-effort: never block on it.
+    silence_spans = await asyncio.to_thread(_detect_silence, audio_path)
+    filler_count = sum(1 for s in segments for w in s.words if w.is_filler)
+    fresh = await job_service.get_video_job(session, job_id)
+    merged = dict((fresh.payload if fresh else payload) or {})
+    merged["silence_spans"] = silence_spans
+    await job_service.update_payload(session, job_id, merged)
+    logger.info(
+        "job %s transcribed into %s beats (%s fillers, %s silence spans)",
+        job_id,
+        len(beats),
+        filler_count,
+        len(silence_spans),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +350,9 @@ async def stage_llm(
                 "text": b.text,
                 "start_s": b.start_s,
                 "end_s": b.end_s,
+                # Carry word timings forward so re-saving beats with queries
+                # doesn't wipe the per-word data the renderer/editor rely on.
+                "words": b.words,
                 "queries": {
                     "visual": plan.visual_queries,
                     "metaphor": plan.metaphor_queries,
@@ -612,48 +669,120 @@ async def stage_render(
         settings, audio_path, payload.get("audio_object")
     )
 
-    segments = [
-        BeatSegment(index=b.index, text=b.text, start_s=b.start_s, end_s=b.end_s)
+    timing_segments = [
+        BeatTiming(
+            index=b.index,
+            start_s=b.start_s,
+            end_s=b.end_s,
+            kind=getattr(b, "beat_kind", "narration") or "narration",
+            duration_s=float(getattr(b, "duration_s", None) or 0.0),
+        )
         for b in render_rows
     ]
     audio_duration_s = await asyncio.to_thread(_probe_audio_duration, audio_path)
-    boundaries = _clip_boundaries(segments, audio_duration_s)
+    excluded = set(payload.get("excluded_beats") or [])
+    kept = [b for b in render_rows if b.index not in excluded]
+    if not kept:
+        raise RuntimeError("No beats to render after exclusions.")
+
+    # "Tighten audio" options: cut silences/pauses and/or filler words. Detection
+    # happened at transcription (silence spans on the payload, filler flags on the
+    # beat words); the render simply honours the toggles.
+    remove_silence = bool(payload.get("remove_silence"))
+    remove_fillers = bool(payload.get("remove_fillers"))
+    silence_spans = [
+        (float(s[0]), float(s[1]))
+        for s in (payload.get("silence_spans") or [])
+        if isinstance(s, (list, tuple)) and len(s) == 2
+    ]
+    words_by_index = {
+        b.index: [
+            WordTiming(start_s=float(w["s"]), end_s=float(w["e"]), is_filler=bool(w.get("f")))
+            for w in (b.words or [])
+            if isinstance(w, dict) and "s" in w and "e" in w
+        ]
+        for b in render_rows
+    }
+
+    plan = build_render_plan(
+        timing_segments,
+        audio_duration_s,
+        excluded,
+        words_by_index=words_by_index if remove_fillers else None,
+        silence_spans=silence_spans,
+        remove_silence=remove_silence,
+        remove_fillers=remove_fillers,
+    )
+    duration_by_index = dict(plan.beat_durations)
+    # Audio is re-assembled from the ordered plan whenever the timeline differs
+    # from the raw narration: any exclusion, tighten-audio option, OR a standalone
+    # inserted beat (which splices a silent gap into the track). Otherwise the full
+    # narration is muxed as-is (the historical fast path).
+    tightened = remove_silence or remove_fillers
+    audio_pieces = (
+        plan.audio_pieces if (excluded or tightened or plan.has_inserts) else None
+    )
+
     logger.info(
-        "timeline: %s beats, audio=%.2fs, last boundary=%.2fs",
-        len(segments),
+        "timeline: %s beats (%s kept, %s excluded, inserts=%s), audio=%.2fs, render=%.2fs "
+        "(remove_silence=%s remove_fillers=%s, %s windows, %s audio pieces)",
+        len(timing_segments),
+        len(kept),
+        len(excluded),
+        plan.has_inserts,
         audio_duration_s or -1.0,
-        boundaries[-1],
+        plan.total_s,
+        remove_silence,
+        remove_fillers,
+        len(plan.windows),
+        len(plan.audio_pieces),
     )
 
     show_subs = bool(payload.get("subtitles"))
     timeline: list[TimelineBeat] = []
-    for i, beat in enumerate(render_rows):
-        clip_start = boundaries[i]
-        clip_end = boundaries[i + 1]
+    for beat in render_rows:
+        if beat.index in excluded:
+            continue
+        clip_duration = duration_by_index.get(beat.index, 0.0)
+        if clip_duration <= 0:
+            continue
         if beat.media_url:
             # For the user's own video, the media_url is the whole uploaded clip;
             # seek into it at this beat's narration start so each beat shows the
             # matching slice (the source's audio == the narration, so beat.start_s
             # is the correct in-point). Stock clips have no in-point (start at 0).
-            is_user_video = (beat.platform or "").lower() == "user_video"
+            platform = (beat.platform or "").lower()
+            is_user_video = platform == "user_video"
+            # An animated text card is a per-beat clip we recorded in the browser:
+            # play it from its start (in-point 0) and mix its baked-in per-word
+            # SFX audio on top of the narration. Its text is already drawn into
+            # the clip, so never burn captions over it.
+            is_animated = platform == "animated_text"
             timeline.append(
                 TimelineBeat(
-                    clip_start,
-                    clip_end,
+                    0.0,
+                    clip_duration,
                     kind=beat.kind or "photo",
                     # Burn the beat's narration as a bottom caption when subtitles
                     # are requested; the renderer draws it during the per-segment
                     # encode it already runs (no extra pass).
                     media_url=beat.media_url,
-                    text_overlay=beat.text if show_subs else None,
-                    source_in_s=float(beat.start_s) if is_user_video else None,
+                    text_overlay=beat.text if (show_subs and not is_animated) else None,
+                    source_in_s=(
+                        float(beat.start_s)
+                        if is_user_video
+                        else 0.0
+                        if is_animated
+                        else None
+                    ),
+                    mix_audio=is_animated,
                 )
             )
         else:
             timeline.append(
                 TimelineBeat(
-                    clip_start,
-                    clip_end,
+                    0.0,
+                    clip_duration,
                     kind="text",
                     media_url=None,
                     text_overlay=beat.text,
@@ -668,7 +797,12 @@ async def stage_render(
     render_root.mkdir(parents=True, exist_ok=True)
     output_path = str(render_root / f"{job_id}.mp4")
     await renderer.render(
-        audio_path, timeline, output_path, width=out_width, height=out_height
+        audio_path,
+        timeline,
+        output_path,
+        width=out_width,
+        height=out_height,
+        audio_pieces=audio_pieces,
     )
 
     # Local disk or Backblaze B2 depending on settings.storage_local.

@@ -9,12 +9,16 @@ import {
   ImageIcon,
   Gauge,
   Lock,
+  Scissors,
+  VolumeX,
+  Eraser,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import { ThemeBadge } from "@/components/theme-badge";
 import { PreviewPlayer } from "@/components/preview-player";
+import { prewarmPreviewAudio } from "@/lib/preview-audio";
 import type { Aspect, VideoJob } from "@/lib/types";
 import { ASPECTS, findChosenAsset, QUALITIES, useEditorStore } from "@/lib/store";
 import { cn } from "@/lib/utils";
@@ -27,14 +31,24 @@ const ASPECT_BOX: Record<Aspect, string> = {
 
 function PreviewFrame({ job }: { job: VideoJob }) {
   // The box is a poster; pressing play opens the full-size player popup.
-  const firstChosen = job.beats.map(findChosenAsset).find(Boolean);
-  const hasContent = job.beats.length > 0;
+  const firstChosen = job.beats
+    .filter((b) => b.included)
+    .map(findChosenAsset)
+    .find(Boolean);
+  const hasContent = job.beats.some((b) => b.included);
   const showVideoFrame =
     firstChosen?.kind === "video" && Boolean(firstChosen.mediaUrl);
+  const previewSourceInS = firstChosen?.sourceInS ?? 0;
   const previewVideoSrc = firstChosen?.thumbUrl
     ? firstChosen.mediaUrl
-    : `${firstChosen?.mediaUrl}#t=0.1`;
+    : `${firstChosen?.mediaUrl}#t=${Math.max(0.1, previewSourceInS)}`;
   const [open, setOpen] = React.useState(false);
+
+  // Decode the narration ahead of time so pressing play opens with audio
+  // instantly instead of showing "loading audio…".
+  React.useEffect(() => {
+    if (hasContent) prewarmPreviewAudio(job.audioUrl);
+  }, [job.audioUrl, hasContent]);
 
   return (
     <div className="flex flex-col items-center gap-2">
@@ -52,6 +66,9 @@ function PreviewFrame({ job }: { job: VideoJob }) {
             playsInline
             preload="metadata"
             className="size-full object-cover opacity-80"
+            onLoadedMetadata={(e) => {
+              e.currentTarget.currentTime = previewSourceInS;
+            }}
           />
         ) : firstChosen?.thumbUrl ? (
           <img src={firstChosen.thumbUrl} alt="" className="size-full object-cover opacity-80" />
@@ -114,6 +131,21 @@ export function Sidebar({
   const pct = total > 0 ? Math.round((chosen / total) * 100) : 0;
   // Aspect/quality drive the clip search, so they lock once it has started.
   const locked = Boolean(job.prepared);
+
+  // "Tighten audio" insight: how many fillers / how much dead air we found, so
+  // each toggle states what it would actually cut from the kept beats.
+  const fillerCount = React.useMemo(
+    () =>
+      job.beats.reduce(
+        (n, b) => n + (b.included ? b.words?.filter((w) => w.filler).length ?? 0 : 0),
+        0,
+      ),
+    [job.beats],
+  );
+  const silenceSpans = job.silenceSpans ?? [];
+  const silenceSaved = Math.round(
+    silenceSpans.reduce((s, [a, b]) => s + Math.max(0, b - a), 0),
+  );
 
   return (
     <aside className="space-y-4 lg:sticky lg:top-[136px]">
@@ -210,6 +242,49 @@ export function Sidebar({
         </label>
       </div>
 
+      <div className="panel space-y-4 p-4">
+        <div className="flex items-center gap-2">
+          <Scissors className="size-4 text-accent" />
+          <h3 className="font-heading text-sm font-semibold text-cream">Tighten audio</h3>
+        </div>
+
+        <label className="flex items-start justify-between gap-3">
+          <span className="min-w-0">
+            <span className="flex items-center gap-2 text-sm text-cream">
+              <VolumeX className="size-4 text-faint" />
+              Remove silences
+            </span>
+            <span className="mt-0.5 block text-xs text-faint">
+              {silenceSpans.length > 0
+                ? `Cuts ${silenceSpans.length} pause${silenceSpans.length === 1 ? "" : "s"} (~${silenceSaved}s) of dead air.`
+                : "Trims pauses and gaps between beats."}
+            </span>
+          </span>
+          <Switch
+            checked={job.removeSilence}
+            onCheckedChange={(v) => updateSettings({ removeSilence: v })}
+          />
+        </label>
+
+        <label className="flex items-start justify-between gap-3">
+          <span className="min-w-0">
+            <span className="flex items-center gap-2 text-sm text-cream">
+              <Eraser className="size-4 text-faint" />
+              Remove filler words
+            </span>
+            <span className="mt-0.5 block text-xs text-faint">
+              {fillerCount > 0
+                ? `Cuts ${fillerCount} filler${fillerCount === 1 ? "" : "s"} (“um”, “uh”, “hmm”) — struck through in the script.`
+                : "Drops “um”, “uh”, “hmm” and similar."}
+            </span>
+          </span>
+          <Switch
+            checked={job.removeFillers}
+            onCheckedChange={(v) => updateSettings({ removeFillers: v })}
+          />
+        </label>
+      </div>
+
       <div className="panel space-y-3 p-4">
         <div className="flex items-center justify-between">
           <h3 className="font-heading text-sm font-semibold text-cream">Clips chosen</h3>
@@ -224,9 +299,11 @@ export function Sidebar({
           />
         </div>
         <p className="text-xs text-faint">
-          {ready
-            ? "Every beat has a visual. You're ready to render."
-            : `${total - chosen} ${total - chosen === 1 ? "beat" : "beats"} still need a visual.`}
+          {total === 0
+            ? "Include at least one beat to render."
+            : ready
+              ? "Every kept beat has a visual. You're ready to render."
+              : `${total - chosen} ${total - chosen === 1 ? "beat" : "beats"} still need a visual.`}
         </p>
       </div>
 

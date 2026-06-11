@@ -2,16 +2,17 @@
 
 import * as React from "react";
 import {
-  AlertTriangle,
   CheckCircle2,
   Download,
   Pencil,
   RefreshCw,
+  VideoOff,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ThemeBadge } from "@/components/theme-badge";
 import type { VideoJob } from "@/lib/types";
-import { findChosenAsset, jobPhase } from "@/lib/store";
+import { findChosenAsset, jobPhase, keptBeats, renderDurationSec } from "@/lib/store";
+import { friendlyError } from "@/lib/errors";
 import { fmtTime } from "@/lib/utils";
 import { pickRenderScene, RenderSceneStage } from "@/components/render-scenes";
 
@@ -41,7 +42,10 @@ export function RenderPanel({
     return () => clearInterval(t);
   }, [phase, scene.lines.length]);
 
-  const poster = job.beats.map(findChosenAsset).find(Boolean);
+  const poster = job.beats
+    .filter((b) => b.included)
+    .map(findChosenAsset)
+    .find(Boolean);
   const showPosterVideoFrame =
     poster?.kind === "video" && Boolean(poster.mediaUrl);
   const posterVideoSrc = poster?.thumbUrl
@@ -53,12 +57,24 @@ export function RenderPanel({
     <aside className="space-y-4 lg:sticky lg:top-[136px]">
       {phase === "failed" ? (
         <div className="panel p-6 text-center">
-          <div className="mx-auto grid size-14 place-items-center rounded-full bg-destructive/15 text-destructive">
-            <AlertTriangle className="size-7" />
+          {/* "Broken preview" placeholder — conveys something went wrong without
+              leaking the raw backend error. */}
+          <div className="mx-auto flex aspect-video w-full max-w-[220px] items-center justify-center rounded-xl border border-dashed border-destructive/40 bg-destructive/5">
+            <div className="flex flex-col items-center gap-2 text-destructive/80">
+              <VideoOff className="size-9" />
+              <span className="flex gap-1">
+                <span className="h-1 w-6 rounded-full bg-destructive/30" />
+                <span className="h-1 w-3 rounded-full bg-destructive/20" />
+                <span className="h-1 w-4 rounded-full bg-destructive/30" />
+              </span>
+            </div>
           </div>
-          <h3 className="mt-4 font-heading text-lg font-bold text-cream">Render failed</h3>
+          <h3 className="mt-4 font-heading text-lg font-bold text-cream">Something broke</h3>
           <p className="mt-1 text-xs text-faint">
-            {job.error ?? "Something went wrong while building your video. You can try again."}
+            {friendlyError(
+              job.error,
+              "We hit a snag building your video. Nothing you did wrong — we're on it. Please try again.",
+            )}
           </p>
           <div className="mt-5 flex flex-col gap-2">
             <Button variant="primary" className="w-full" onClick={onRetry}>
@@ -78,7 +94,7 @@ export function RenderPanel({
           </div>
           <h3 className="mt-4 font-heading text-xl font-bold text-cream">Your video is ready</h3>
           <p className="mt-1 font-mono text-[11px] text-faint">
-            {job.aspect} · {fmtTime(job.durationSec ?? 0)} · {job.beats.length} beats
+            {job.aspect} · {fmtTime(renderDurationSec(job))} · {keptBeats(job).length} beats
           </p>
           <div className="mt-2 flex justify-center">
             <ThemeBadge theme={job.theme} />

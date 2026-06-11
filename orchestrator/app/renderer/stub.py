@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from ..timeline import AudioPiece
 from .base import Renderer, TimelineBeat
 
 
@@ -17,8 +18,10 @@ class StubRenderer(Renderer):
         *,
         width: int = 1280,
         height: int = 720,
+        audio_windows: list[tuple[float, float]] | None = None,
+        audio_pieces: list[AudioPiece] | None = None,
     ) -> str:
-        del audio_path, timeline, width, height
+        del audio_path, timeline, width, height, audio_windows, audio_pieces
 
         def _write() -> str:
             path = Path(output_path)

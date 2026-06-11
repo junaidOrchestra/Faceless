@@ -59,6 +59,10 @@ class Settings(BaseSettings):
         default=20,
         description="Max POST /videos/{id}/render requests per user per minute.",
     )
+    rate_limit_feedback_per_min: int = Field(
+        default=5,
+        description="Max POST /feedback submissions per user per minute.",
+    )
 
     # --- Database connection pool --------------------------------------------
     # Bound the pool so concurrency (stage workers each hold a session for the
@@ -166,7 +170,18 @@ class Settings(BaseSettings):
     llm_concurrency: int = Field(default=2, description="Parallel LLM+clip-submit workers.")
     render_concurrency: int = Field(default=2, description="Parallel ffmpeg render workers.")
 
-    worker_poll_interval_s: float = 1.0
+    worker_poll_interval_s: float = Field(
+        default=1.0,
+        description="Short retry/sleep interval for worker loop errors and legacy polling.",
+    )
+    worker_queue_block_timeout_s: float = Field(
+        default=60.0,
+        description=(
+            "How long Redis workers block waiting for a queue item before "
+            "waking up. Longer values dramatically reduce idle Redis command "
+            "usage while still returning immediately when a job is enqueued."
+        ),
+    )
     job_running_timeout_s: float = 900.0
     job_heartbeat_interval_s: float = Field(
         default=15.0,

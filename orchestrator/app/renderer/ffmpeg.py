@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from ..timeline import AudioPiece
 from .base import Renderer, TimelineBeat
 
 logger = logging.getLogger(__name__)
@@ -140,9 +141,18 @@ class FFmpegRenderer(Renderer):
         *,
         width: int = 1280,
         height: int = 720,
+        audio_windows: list[tuple[float, float]] | None = None,
+        audio_pieces: list[AudioPiece] | None = None,
     ) -> str:
         return await asyncio.to_thread(
-            self._render_sync, audio_path, timeline, output_path, width, height
+            self._render_sync,
+            audio_path,
+            timeline,
+            output_path,
+            width,
+            height,
+            audio_windows,
+            audio_pieces,
         )
 
     def _render_sync(
@@ -152,11 +162,20 @@ class FFmpegRenderer(Renderer):
         output_path: str,
         width: int = 1280,
         height: int = 720,
+        audio_windows: list[tuple[float, float]] | None = None,
+        audio_pieces: list[AudioPiece] | None = None,
     ) -> str:
         work = self._temp_dir / Path(output_path).stem
         try:
             return self._render_work(
-                work, audio_path, timeline, output_path, width, height
+                work,
+                audio_path,
+                timeline,
+                output_path,
+                width,
+                height,
+                audio_windows,
+                audio_pieces,
             )
         finally:
             # Always remove the intermediate work dir — even when the render
@@ -173,6 +192,8 @@ class FFmpegRenderer(Renderer):
         output_path: str,
         width: int = 1280,
         height: int = 720,
+        audio_windows: list[tuple[float, float]] | None = None,
+        audio_pieces: list[AudioPiece] | None = None,
     ) -> str:
         work.mkdir(parents=True, exist_ok=True)
         src_dir = work / "src"
@@ -231,6 +252,9 @@ class FFmpegRenderer(Renderer):
         download_secs: list[float] = []
         encode_secs: list[float] = []
         encoded_segments: list[tuple[int, str, float, float]] = []
+        # url -> local file (or None if its download failed). Reused to mix the
+        # per-word SFX audio of animated text-card clips into the final track.
+        url_local: dict[str, Path | None] = {}
 
         def _timed_download(url: str, dest: Path) -> Path:
             t = time.monotonic()
@@ -302,6 +326,7 @@ class FFmpegRenderer(Renderer):
                         exc,
                     )
                     local_path = None
+                url_local[url] = local_path
                 for i in sorted(
                     url_to_indices[url],
                     key=lambda idx: timeline[idx].end_s - timeline[idx].start_s,
@@ -365,36 +390,207 @@ class FFmpegRenderer(Renderer):
             ],
         )
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        # Video is already a clean CFR H.264 stream, so copy it and only encode
-        # audio; `-shortest` trims to whichever track ends first. Map streams
-        # explicitly — the assembled video from input 0, the narration's audio
-        # from input 1 — because when the narration is itself a *video* file (a
-        # video upload/recording) ffmpeg's default stream selection could
-        # otherwise pull that file's video track into the output.
+        if audio_pieces:
+            # Standalone inserted beats splice silent gaps into the narration, so
+            # the track is assembled from an ordered narration/silence list.
+            narration_path = work / "narration.m4a"
+            self._assemble_audio(audio_path, audio_pieces, narration_path)
+            mux_audio_path = str(narration_path)
+        elif audio_windows:
+            narration_path = work / "narration.m4a"
+            self._trim_audio(audio_path, audio_windows, narration_path)
+            mux_audio_path = str(narration_path)
+        else:
+            mux_audio_path = audio_path
+
+        # Beats whose clip carries its own audio (animated text cards' per-word
+        # SFX) are mixed on top of the narration at their timeline offset. The
+        # offset is the cumulative SEGMENT duration (matching the concatenated
+        # video), so the SFX line up with the visuals.
+        sfx_mix: list[tuple[float, Path]] = []
+        offset = 0.0
+        for beat in timeline:
+            seg_dur = max(0.5, beat.end_s - beat.start_s)
+            if beat.mix_audio and beat.media_url:
+                local = url_local.get(beat.media_url)
+                if local is not None:
+                    sfx_mix.append((offset, local))
+            offset += seg_dur
+
+        self._mux_final(silent_video, mux_audio_path, sfx_mix, output_path)
+        # The final mp4 lives at output_path (the mounted folder root); the work
+        # dir only holds intermediate seg_*.mp4/silent.mp4 and is removed by the
+        # caller's finally so it's cleaned up on success and failure alike.
+        return output_path
+
+    def _mux_final(
+        self,
+        silent_video: Path,
+        mux_audio_path: str,
+        sfx_mix: list[tuple[float, Path]],
+        output_path: str,
+    ) -> None:
+        """Mux the assembled video with narration, mixing any per-beat SFX clips.
+
+        Video is already a clean CFR H.264 stream, so it is stream-copied and
+        only audio is (re)encoded; ``-shortest`` trims to the narration length.
+        Streams are mapped explicitly (video from input 0, audio from the
+        narration / mixed graph) so a narration that is itself a video file never
+        leaks its video track into the output.
+
+        When ``sfx_mix`` is empty this is the historical single-narration mux.
+        Otherwise each SFX clip's audio is delayed to its beat offset and
+        ``amix``-ed over the narration. If the mixed mux fails for any reason
+        (e.g. a clip with no decodable audio track), we fall back to the plain
+        narration mux so a render never fails just because of an SFX overlay.
+        """
+
+        simple = [
+            "ffmpeg", "-y",
+            "-i", str(silent_video),
+            "-i", mux_audio_path,
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-shortest",
+            output_path,
+        ]
+        if not sfx_mix:
+            self._ffmpeg(simple)
+            return
+
+        inputs: list[str] = ["-i", str(silent_video), "-i", mux_audio_path]
+        for _, path in sfx_mix:
+            inputs += ["-i", str(path)]
+        # Normalize every input to a common format before amix (amix needs a
+        # shared sample rate/layout). Narration is input 1; SFX are inputs 2..N.
+        filters = ["[1:a]aresample=48000,aformat=channel_layouts=stereo[narr]"]
+        mix_labels = ["[narr]"]
+        for k, (clip_offset, _) in enumerate(sfx_mix):
+            ms = max(0, int(round(clip_offset * 1000)))
+            filters.append(
+                f"[{2 + k}:a]aresample=48000,aformat=channel_layouts=stereo,"
+                f"adelay={ms}|{ms},volume=0.8[sx{k}]"
+            )
+            mix_labels.append(f"[sx{k}]")
+        # ``duration=first`` keeps the output as long as the narration (the first
+        # input), so trailing SFX past the end are clipped rather than extending.
+        filters.append(
+            "".join(mix_labels)
+            + f"amix=inputs={len(mix_labels)}:duration=first:normalize=0[aout]"
+        )
+        mixed = [
+            "ffmpeg", "-y",
+            *inputs,
+            "-filter_complex", ";".join(filters),
+            "-map", "0:v:0",
+            "-map", "[aout]",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-shortest",
+            output_path,
+        ]
+        try:
+            self._ffmpeg(mixed)
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "SFX mix failed (%s SFX clips); falling back to narration-only mux: %s",
+                len(sfx_mix),
+                _stderr(exc),
+            )
+            self._ffmpeg(simple)
+
+    def _assemble_audio(
+        self,
+        audio_path: str,
+        pieces: list[AudioPiece],
+        output_path: Path,
+    ) -> None:
+        """Assemble the narration track from ordered narration slices + silence.
+
+        Used when the timeline contains standalone inserted beats (animated text
+        cards with no narration): each such beat contributes a ``silence`` piece of
+        its on-screen duration, so the muxed audio stays the same length as the
+        video and the narration after the card resumes at the right moment. Every
+        piece is normalized to 48 kHz stereo before ``concat`` so the formats
+        match. Silence is generated with ``anullsrc`` trimmed to the gap length.
+        """
+
+        if not pieces:
+            raise ValueError("audio_pieces must not be empty")
+        parts: list[str] = []
+        for i, piece in enumerate(pieces):
+            if piece.kind == "silence":
+                dur = max(0.0, float(piece.duration_s))
+                parts.append(
+                    f"anullsrc=r=48000:cl=stereo,atrim=0:{dur:.3f},"
+                    f"asetpts=PTS-STARTPTS[a{i}]"
+                )
+            else:
+                start = max(0.0, float(piece.start_s))
+                end = max(start, float(piece.end_s))
+                parts.append(
+                    f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS,"
+                    f"aformat=sample_rates=48000:channel_layouts=stereo[a{i}]"
+                )
+        concat_inputs = "".join(f"[a{i}]" for i in range(len(pieces)))
+        filter_complex = (
+            ";".join(parts)
+            + f";{concat_inputs}concat=n={len(pieces)}:v=0:a=1[outa]"
+        )
         self._ffmpeg(
             [
                 "ffmpeg",
                 "-y",
                 "-i",
-                str(silent_video),
-                "-i",
                 audio_path,
+                "-filter_complex",
+                filter_complex,
                 "-map",
-                "0:v:0",
-                "-map",
-                "1:a:0",
-                "-c:v",
-                "copy",
+                "[outa]",
                 "-c:a",
                 "aac",
-                "-shortest",
-                output_path,
+                str(output_path),
             ],
         )
-        # The final mp4 lives at output_path (the mounted folder root); the work
-        # dir only holds intermediate seg_*.mp4/silent.mp4 and is removed by the
-        # caller's finally so it's cleaned up on success and failure alike.
-        return output_path
+
+    def _trim_audio(
+        self,
+        audio_path: str,
+        windows: list[tuple[float, float]],
+        output_path: Path,
+    ) -> None:
+        """Cut and concatenate narration windows into one AAC track."""
+
+        if not windows:
+            raise ValueError("audio_windows must not be empty")
+        parts: list[str] = []
+        for i, (start, end) in enumerate(windows):
+            parts.append(
+                f"[0:a]atrim=start={max(0.0, start):.3f}:end={max(start, end):.3f},"
+                f"asetpts=PTS-STARTPTS[a{i}]"
+            )
+        concat_inputs = "".join(f"[a{i}]" for i in range(len(windows)))
+        filter_complex = (
+            ";".join(parts)
+            + f";{concat_inputs}concat=n={len(windows)}:v=0:a=1[outa]"
+        )
+        self._ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                audio_path,
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                "[outa]",
+                "-c:a",
+                "aac",
+                str(output_path),
+            ],
+        )
 
     def _encode_beat(
         self,

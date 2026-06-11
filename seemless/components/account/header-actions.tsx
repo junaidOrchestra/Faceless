@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { CreditBadge } from "@/components/account/credit-badge";
+import { Skeleton } from "@/components/ui/skeleton";
 import { useMe } from "@/lib/use-me";
 
 /**
@@ -11,7 +12,16 @@ import { useMe } from "@/lib/use-me";
 export function HeaderActions() {
   const { me, loading } = useMe();
 
-  if (loading) return null;
+  // Stable placeholders while the account loads, so the controls don't pop in
+  // (and shift the header) once `/api/me` resolves on a cold backend.
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2" aria-hidden>
+        <Skeleton className="h-[26px] w-[88px] rounded-full" />
+        <Skeleton className="h-[26px] w-[72px] rounded-full" />
+      </div>
+    );
+  }
 
   if (!me) {
     return (

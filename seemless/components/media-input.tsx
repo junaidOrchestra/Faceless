@@ -4,7 +4,7 @@ import * as React from "react";
 import { useRouter } from "next/navigation";
 import { FileAudio, FileVideo, Loader2, Mic, Video } from "lucide-react";
 import { uploadAudio } from "@/lib/api";
-import { rememberPreviewAudio } from "@/lib/preview-audio";
+import { rememberPreviewAudio, prewarmPreviewAudio } from "@/lib/preview-audio";
 import { FileDrop } from "@/components/file-drop";
 import { Recorder } from "@/components/recorder";
 import { cn } from "@/lib/utils";
@@ -48,7 +48,10 @@ export function MediaInput() {
         const { videoJobId } = await uploadAudio(file, controller.signal);
         // The synced preview plays the narration from this blob (the audio track
         // for video inputs), so remember it for any media file.
-        rememberPreviewAudio(videoJobId, file);
+        const previewUrl = rememberPreviewAudio(videoJobId, file);
+        // Decode the narration now (the file is already local) so the editor's
+        // preview opens instantly instead of waiting on a decode.
+        prewarmPreviewAudio(previewUrl);
         try {
           sessionStorage.setItem(`sf:name:${videoJobId}`, file.name);
         } catch {

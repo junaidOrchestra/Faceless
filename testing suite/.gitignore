@@ -1,0 +1,9 @@
+.env
+output/
+work/
+*.mp4
+__pycache__/
+*.pyc
+# Cookies are secrets — keep everything except the folder's README.
+cookies/*
+!cookies/README.md

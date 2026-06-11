@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Bricolage_Grotesque, Hanken_Grotesk, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
+import { FeedbackWidget } from "@/components/feedback/feedback-dialog";
 
 const bricolage = Bricolage_Grotesque({
   subsets: ["latin"],
@@ -43,6 +44,7 @@ export default function RootLayout({
         className={`${bricolage.variable} ${hanken.variable} ${mono.variable}`}
       >
         {children}
+        <FeedbackWidget />
       </body>
     </html>
   );

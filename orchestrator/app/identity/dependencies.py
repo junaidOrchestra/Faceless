@@ -11,6 +11,7 @@ so the rest of the app has no dependency on Supabase specifically.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Annotated
 
@@ -23,6 +24,34 @@ from ..services import users as user_service
 from .tokens import InvalidTokenError, verify_access_token
 
 _bearer = HTTPBearer(auto_error=False)
+
+# Per-request identity bookkeeping (upsert mirror + monthly grant) is correct but
+# costs a few DB round-trips to the (cloud) database on EVERY authenticated call —
+# noticeable on hot, read-only endpoints like GET /me polled from the header. We
+# only actually need it occasionally (first sight, email change, a new monthly
+# period), so throttle it with a small in-process TTL cache: a user seen within
+# the window skips the upsert/grant entirely. Credit balances stay accurate
+# because every endpoint still reads the live row; only the (idempotent)
+# write-path is debounced. Per-process and best-effort — a cold worker simply
+# runs it once.
+_SEEN_TTL_S = 600.0
+_SEEN_MAX = 10_000
+_seen_users: dict[str, float] = {}
+
+
+def _recently_synced(user_id: str) -> bool:
+    """True if we ran the upsert/grant for this user within the TTL window."""
+
+    now = time.monotonic()
+    last = _seen_users.get(user_id)
+    if last is not None and now - last < _SEEN_TTL_S:
+        return True
+    # Bound memory: drop the whole map if it grows unexpectedly large (cheap and
+    # rare). The next request for each user just re-syncs once.
+    if len(_seen_users) >= _SEEN_MAX:
+        _seen_users.clear()
+    _seen_users[user_id] = now
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,11 +94,12 @@ async def get_current_user(
         raise _unauthorized("Token is missing the subject claim.")
     email = claims.get("email")
 
-    # Mirror the identity into our own Postgres and apply any due grant. These
-    # run per-request but are cheap: the upsert is a single statement and the
-    # grant short-circuits once granted for the current period.
-    await user_service.upsert_user(session, sub, email=email)
-    await user_service.ensure_monthly_grant(session, sub)
+    # Mirror the identity into our own Postgres and apply any due grant. Both are
+    # idempotent, so we debounce them per user (TTL cache) to avoid spending DB
+    # round-trips on every authenticated request (e.g. the header polling /me).
+    if not _recently_synced(sub):
+        await user_service.upsert_user(session, sub, email=email)
+        await user_service.ensure_monthly_grant(session, sub)
 
     return CurrentUser(id=sub, email=email)
 

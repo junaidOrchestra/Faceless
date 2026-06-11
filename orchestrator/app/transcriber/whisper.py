@@ -11,7 +11,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from .base import BeatSegment, Transcriber
+from .base import BeatSegment, Transcriber, WordSpan
+from .fillers import is_filler
 from .segmenter import Beat, SegmenterConfig, Word, segment
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,24 @@ class WhisperTranscriber(Transcriber):
     async def transcribe(self, audio_path: str) -> list[BeatSegment]:
         # faster-whisper is sync; run in a thread so we do not block the event loop.
         beats = await asyncio.to_thread(self.beats_from_audio, audio_path)
-        return [BeatSegment(b.index, b.text, b.start_s, b.end_s) for b in beats]
+        return [
+            BeatSegment(
+                b.index,
+                b.text,
+                b.start_s,
+                b.end_s,
+                words=[
+                    WordSpan(
+                        text=w.text,
+                        start_s=float(w.start),
+                        end_s=float(w.end),
+                        is_filler=is_filler(w.text),
+                    )
+                    for w in b.words
+                ],
+            )
+            for b in beats
+        ]
 
     def beats_from_audio(self, audio_path: str) -> list[Beat]:
         """Synchronous helper returning rich :class:`Beat` objects (for debugging)."""

@@ -32,6 +32,12 @@ from .sources.registry import get_source
 
 logger = logging.getLogger(__name__)
 
+# Openverse proxies thumbnails and can return 424 Failed Dependency even when the
+# full image is fine. When that happens we fall back to downloading the main
+# image — but the originals are large, so cap the number of fallbacks per item to
+# avoid pulling many full-resolution files in one go.
+_MAX_OPENVERSE_FALLBACKS = 3
+
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     """Cosine similarity for L2-normalized vectors (dot product)."""
@@ -354,7 +360,11 @@ async def process_item(
         # Download only cache misses in parallel (bounded concurrency).
         sem = asyncio.Semaphore(8)
 
+        # Cap how many Openverse 424 fallbacks we do per item (see constant above).
+        openverse_fallbacks = 0
+
         async def _fetch(candidate: Candidate) -> tuple[Candidate, bytes | None]:
+            nonlocal openverse_fallbacks
             async with sem:
                 blob = await _download_preview(
                     http_client,
@@ -362,6 +372,34 @@ async def process_item(
                     max_bytes=settings.preview_max_bytes,
                     timeout_s=settings.preview_total_timeout_s,
                 )
+                # Openverse proxies thumbnails and can return 424 Failed
+                # Dependency even when the full image is fine. Only for Openverse,
+                # fall back to the main image (media_url) so the candidate isn't
+                # dropped, and correct preview_url to the working URL so the
+                # stored asset / editor poster point at it too. The originals are
+                # large, so reserve a slot before fetching and stop after
+                # _MAX_OPENVERSE_FALLBACKS per item.
+                if (
+                    blob is None
+                    and candidate.platform == "openverse"
+                    and candidate.media_url
+                    and candidate.media_url != candidate.preview_url
+                    and openverse_fallbacks < _MAX_OPENVERSE_FALLBACKS
+                ):
+                    openverse_fallbacks += 1
+                    blob = await _download_preview(
+                        http_client,
+                        candidate.media_url,
+                        max_bytes=settings.preview_max_bytes,
+                        timeout_s=settings.preview_total_timeout_s,
+                    )
+                    if blob is not None:
+                        logger.info(
+                            "openverse thumbnail failed (%s); using main image %s",
+                            candidate.preview_url,
+                            candidate.media_url,
+                        )
+                        candidate.preview_url = candidate.media_url
             return candidate, blob
 
         fetched = await asyncio.gather(*[_fetch(c) for c in missing_pool])

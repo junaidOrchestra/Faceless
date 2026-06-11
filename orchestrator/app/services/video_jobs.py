@@ -23,6 +23,7 @@ from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Beat, BeatAssignment, VideoJob
+from ..timeline import BeatTiming, WordTiming, render_duration_seconds
 
 # active stage status -> the pending status it should reset to on restart.
 ORPHAN_RESETS: dict[str, str] = {
@@ -56,7 +57,32 @@ class RenderBeatRow:
     end_s: float
     platform: str | None
     media_url: str | None
-    kind: str | None
+    kind: str | None  # the SELECTED assignment's media kind: "photo" | "video"
+    words: list[dict[str, Any]] | None = None
+    # Beat origin: "narration" (transcript window) or "insert" (standalone animated
+    # text card with no narration, lasting ``duration_s`` seconds).
+    beat_kind: str = "narration"
+    duration_s: float | None = None
+
+
+def _words_to_timings(words: list[dict[str, Any]] | None) -> list[WordTiming]:
+    """Convert stored ``{"s","e","f"}`` word dicts into timeline WordTimings."""
+
+    if not words:
+        return []
+    out: list[WordTiming] = []
+    for w in words:
+        try:
+            out.append(
+                WordTiming(
+                    start_s=float(w["s"]),
+                    end_s=float(w["e"]),
+                    is_filler=bool(w.get("f")),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
 
 
 @dataclass(slots=True)
@@ -289,6 +315,65 @@ async def get_job_duration_seconds(session: AsyncSession, job_id: str) -> float:
     return float(value) if value is not None else 0.0
 
 
+async def count_beats(session: AsyncSession, job_id: str) -> int:
+    """Return how many beats are stored for a job."""
+
+    result = await session.execute(
+        select(func.count()).select_from(Beat).where(Beat.video_job_id == job_id)
+    )
+    return int(result.scalar_one() or 0)
+
+
+async def get_render_duration_seconds(
+    session: AsyncSession,
+    job_id: str,
+    excluded: set[int],
+    *,
+    silence_spans: list[tuple[float, float]] | None = None,
+    remove_silence: bool = False,
+    remove_fillers: bool = False,
+) -> float:
+    """Return the kept duration of a render (for tier limits and credits).
+
+    Honours the same trims the renderer applies: dropped beats, removed silences
+    and removed filler words, so a tightened video is billed by what it actually
+    plays rather than the raw narration length.
+    """
+
+    result = await session.execute(
+        select(Beat.index, Beat.start_s, Beat.end_s, Beat.words, Beat.kind, Beat.duration_s)
+        .where(Beat.video_job_id == job_id)
+        .order_by(Beat.index)
+    )
+    rows = result.all()
+    if not rows:
+        return 0.0
+    segments = [
+        BeatTiming(
+            index=r[0],
+            start_s=r[1],
+            end_s=r[2],
+            kind=r[4] or "narration",
+            duration_s=float(r[5] or 0.0),
+        )
+        for r in rows
+    ]
+    words_by_index = {r[0]: _words_to_timings(r[3]) for r in rows}
+    # Narration length drives the gapless boundaries; standalone inserts add their
+    # own duration via the plan and must not inflate the narration end time.
+    narration_ends = [seg.end_s for seg in segments if seg.kind != "insert"]
+    audio_duration_s = max(narration_ends) if narration_ends else 0.0
+    return render_duration_seconds(
+        segments,
+        audio_duration_s,
+        excluded,
+        words_by_index=words_by_index if remove_fillers else None,
+        silence_spans=silence_spans,
+        remove_silence=remove_silence,
+        remove_fillers=remove_fillers,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Startup reconciliation (one call per process start)
 # ---------------------------------------------------------------------------
@@ -431,6 +516,9 @@ async def save_beats(session: AsyncSession, job_id: str, beats: list[dict[str, A
                 start_s=b["start_s"],
                 end_s=b["end_s"],
                 queries=b.get("queries"),
+                words=b.get("words"),
+                kind=b.get("kind") or "narration",
+                duration_s=b.get("duration_s"),
             )
         )
     await session.commit()
@@ -538,6 +626,186 @@ async def apply_candidate_overrides(
     return changed
 
 
+async def add_or_select_beat_candidate(
+    session: AsyncSession, job_id: str, beat_index: int, candidate: dict[str, Any]
+) -> int:
+    """Append ``candidate`` to a beat's candidate list, select it, and return its index.
+
+    Used by the per-beat clip upload (e.g. an animated text card recorded in the
+    browser). Creates the assignment row if the beat has none yet. The new
+    candidate's media is also copied onto the assignment's scalar columns and
+    ``selected`` is moved to it, so the render uses it even without an explicit
+    override. Returns the new candidate's index (for the editor to echo back in
+    ``RenderRequest.overrides``).
+    """
+
+    result = await session.execute(
+        select(BeatAssignment).where(
+            BeatAssignment.video_job_id == job_id,
+            BeatAssignment.beat_index == beat_index,
+        )
+    )
+    assignment = result.scalar_one_or_none()
+    if assignment is None:
+        assignment = BeatAssignment(video_job_id=job_id, beat_index=beat_index, candidates=[])
+        session.add(assignment)
+
+    candidates = list(assignment.candidates or [])
+    new_index = len(candidates)
+    entry = {**candidate, "selected": True}
+    candidates.append(entry)
+    # Rebuild as a new list with selection on the new entry (so SQLAlchemy sees
+    # the JSONB change and a later GET /beats reflects the pick).
+    assignment.candidates = [
+        {**c, "selected": i == new_index} for i, c in enumerate(candidates)
+    ]
+    assignment.platform = entry.get("platform")
+    assignment.media_url = entry.get("media_url")
+    assignment.preview_url = entry.get("preview_url")
+    assignment.kind = entry.get("kind")
+    assignment.score = entry.get("score")
+    assignment.attribution = entry.get("attribution")
+    await session.commit()
+    return new_index
+
+
+def _resync_words(
+    words: list[dict[str, Any]] | None, text: str
+) -> list[dict[str, Any]] | None:
+    """Re-map corrected ``text`` onto existing per-word timings, when counts match.
+
+    Used by the typo-fix flow: a mis-transcribed word is corrected but the speech
+    (and therefore the timing) is unchanged. If ``text`` splits into the same
+    number of whitespace tokens as ``words``, return a NEW list with each word's
+    text swapped but its start/end/filler flags kept. Otherwise (word added or
+    removed) leave the timings untouched — captions render from the beat text
+    regardless, so they still update; only the per-word strike/typing data lags.
+    """
+
+    if not words:
+        return words
+    tokens = text.split()
+    if len(tokens) != len(words) or any(not isinstance(w, dict) for w in words):
+        return words
+    return [{**w, "t": tok} for w, tok in zip(words, tokens)]
+
+
+async def update_beat_text(
+    session: AsyncSession, job_id: str, beat_index: int, text: str
+) -> Beat | None:
+    """Correct one beat's transcript text (a typo fix); return the updated beat.
+
+    Only ``text`` changes (plus the per-word ``words`` text when the token count is
+    unchanged — see :func:`_resync_words`). Timing, audio, clip assignments,
+    exclusions, and billing are all left alone. Returns ``None`` if the beat
+    doesn't exist for this job.
+    """
+
+    result = await session.execute(
+        select(Beat).where(Beat.video_job_id == job_id, Beat.index == beat_index)
+    )
+    beat = result.scalar_one_or_none()
+    if beat is None:
+        return None
+    beat.text = text
+    beat.words = _resync_words(beat.words, text)
+    await session.commit()
+    await session.refresh(beat)
+    return beat
+
+
+# Offset used to vacate index slots before shifting them down by one. Picking a
+# value far above any realistic beat count lets us move rows into a disjoint
+# range first, so neither UPDATE ever hits a transient primary-key collision
+# (Postgres checks PK uniqueness per-row within a statement).
+_SHIFT_OFFSET = 1_000_000
+
+
+async def insert_animated_beat(
+    session: AsyncSession,
+    job_id: str,
+    *,
+    position: int,
+    text: str,
+    duration_s: float,
+    words: list[dict[str, Any]] | None,
+    candidate: dict[str, Any],
+) -> int:
+    """Insert a standalone animated text-card beat at ``position`` and return its index.
+
+    Existing beats (and their assignments) at index ``>= position`` are shifted up
+    by one to make room, then the new ``kind="insert"`` beat is written with
+    ``start_s == end_s`` set to the narration time it sits at (so the gapless
+    boundary math stays monotonic) and ``duration_s`` giving its on-screen length.
+    The recorded clip ``candidate`` is stored as the beat's selected assignment.
+    Callers should re-fetch the beats afterwards (indices have shifted).
+    """
+
+    count = await count_beats(session, job_id)
+    position = max(0, min(int(position), count))
+
+    # The narration time the card sits at: the start of the beat currently at
+    # ``position`` (which is about to become ``position + 1``), or the end of the
+    # whole narration when appending at the tail.
+    if position < count:
+        anchor_result = await session.execute(
+            select(Beat.start_s).where(
+                Beat.video_job_id == job_id, Beat.index == position
+            )
+        )
+        anchor = float(anchor_result.scalar_one_or_none() or 0.0)
+    else:
+        anchor = await get_job_duration_seconds(session, job_id)
+
+    if position < count:
+        # Vacate slots [position, count) by moving them far up, then back down +1.
+        for table, idx_col in (
+            (Beat, Beat.index),
+            (BeatAssignment, BeatAssignment.beat_index),
+        ):
+            job_col = table.video_job_id
+            await session.execute(
+                update(table)
+                .where(job_col == job_id, idx_col >= position)
+                .values({idx_col.key: idx_col + _SHIFT_OFFSET})
+            )
+            await session.execute(
+                update(table)
+                .where(job_col == job_id, idx_col >= position + _SHIFT_OFFSET)
+                .values({idx_col.key: idx_col - _SHIFT_OFFSET + 1})
+            )
+
+    session.add(
+        Beat(
+            video_job_id=job_id,
+            index=position,
+            text=text,
+            start_s=anchor,
+            end_s=anchor,
+            queries=None,
+            words=words,
+            kind="insert",
+            duration_s=float(duration_s),
+        )
+    )
+    entry = {**candidate, "selected": True}
+    session.add(
+        BeatAssignment(
+            video_job_id=job_id,
+            beat_index=position,
+            platform=entry.get("platform"),
+            media_url=entry.get("media_url"),
+            preview_url=entry.get("preview_url"),
+            kind=entry.get("kind"),
+            score=entry.get("score"),
+            attribution=entry.get("attribution"),
+            candidates=[entry],
+        )
+    )
+    await session.commit()
+    return position
+
+
 async def get_beats_with_assignments(
     session: AsyncSession, job_id: str
 ) -> list[tuple[Beat, BeatAssignment | None]]:
@@ -570,6 +838,9 @@ async def get_render_beats(session: AsyncSession, job_id: str) -> list[RenderBea
             BeatAssignment.platform,
             BeatAssignment.media_url,
             BeatAssignment.kind,
+            Beat.words,
+            Beat.kind,
+            Beat.duration_s,
         )
         .outerjoin(
             BeatAssignment,

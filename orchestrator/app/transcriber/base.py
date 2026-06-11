@@ -3,7 +3,17 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass(slots=True)
+class WordSpan:
+    """One transcribed word with timing and a filler/hesitation flag."""
+
+    text: str
+    start_s: float
+    end_s: float
+    is_filler: bool = False
 
 
 @dataclass(slots=True)
@@ -12,6 +22,8 @@ class BeatSegment:
     text: str
     start_s: float
     end_s: float
+    # Per-word timing within this beat (empty when the recognizer gave none).
+    words: list[WordSpan] = field(default_factory=list)
 
 
 class Transcriber(ABC):

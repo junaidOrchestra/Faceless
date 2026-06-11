@@ -1,10 +1,11 @@
 "use client";
 
 import * as React from "react";
-import { Loader2, Replace, Type, Video } from "lucide-react";
+import { Check, Loader2, Pencil, Play, Plus, Replace, Type, Video, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
 import type { Beat } from "@/lib/types";
 import { VISUAL_TYPE_LABEL } from "@/lib/types";
 import { findChosenAsset } from "@/lib/store";
@@ -60,7 +61,8 @@ function Thumb({ beat, searching }: { beat: Beat; searching?: boolean }) {
   // long scripts while preserving hover-preview behavior.
   const isVideo = asset.kind === "video" && Boolean(asset.mediaUrl);
   const poster = asset.thumbUrl || undefined;
-  const videoSrc = poster ? asset.mediaUrl : `${asset.mediaUrl}#t=0.1`;
+  const sourceInS = asset.sourceInS ?? 0;
+  const videoSrc = poster ? asset.mediaUrl : `${asset.mediaUrl}#t=${Math.max(0.1, sourceInS)}`;
 
   const play = () => {
     if (!isVideo) return;
@@ -70,7 +72,7 @@ function Thumb({ beat, searching }: { beat: Beat; searching?: boolean }) {
     const v = videoRef.current;
     if (v) {
       v.pause();
-      v.currentTime = 0;
+      v.currentTime = sourceInS;
     }
     setActive(false);
   };
@@ -94,6 +96,9 @@ function Thumb({ beat, searching }: { beat: Beat; searching?: boolean }) {
           playsInline
           preload="metadata"
           className="size-full object-cover"
+          onLoadedMetadata={(e) => {
+            e.currentTarget.currentTime = sourceInS;
+          }}
         />
       ) : poster ? (
         <img
@@ -103,9 +108,16 @@ function Thumb({ beat, searching }: { beat: Beat; searching?: boolean }) {
           loading="lazy"
         />
       ) : isVideo ? (
-        <div className="grid size-full place-items-center text-faint">
-          <Video className="size-5" />
-        </div>
+        <video
+          src={videoSrc}
+          muted
+          playsInline
+          preload="metadata"
+          className="size-full object-cover"
+          onLoadedMetadata={(e) => {
+            e.currentTarget.currentTime = sourceInS;
+          }}
+        />
       ) : (
         <img
           src={asset.thumbUrl}
@@ -129,46 +141,140 @@ export const BeatRow = React.memo(function BeatRow({
   index,
   searching,
   locked = false,
+  strikeFillers = false,
   onOpenPicker,
+  onToggleIncluded,
+  onPlayBeat,
+  onEditText,
 }: {
   beat: Beat;
   index: number;
   searching?: boolean;
   locked?: boolean;
+  /** When true, filler words ("um"/"uh"/…) are struck through in the text. */
+  strikeFillers?: boolean;
   onOpenPicker: (beatIndex: number) => void;
+  onToggleIncluded?: (beatIndex: number) => void;
+  /** Preview just this beat (opens the rough-cut player scoped to it). */
+  onPlayBeat?: (beatIndex: number) => void;
+  /** Correct a mis-transcribed word. Returns a promise while it persists (and,
+   *  for animated cards, re-records the clip with the corrected text). */
+  onEditText?: (beatIndex: number, text: string) => void | Promise<void>;
 }) {
+  const [editing, setEditing] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [draft, setDraft] = React.useState(beat.text);
+
+  // Render word-by-word only when we're striking fillers and there is at least
+  // one to strike; otherwise keep the plain (cheaper) text.
+  const fillerWords = beat.words?.filter((w) => w.filler) ?? [];
+  const showWords = strikeFillers && fillerWords.length > 0 && beat.included;
+  // A text fix re-records animated cards (the text is baked into the clip), so a
+  // save can take a few seconds for those beats.
+  const chosenAsset = findChosenAsset(beat);
+  const isAnimated = chosenAsset?.source === "animated";
+  const canEditText = Boolean(onEditText) && !locked && !beat.loading;
+
+  const startEdit = () => {
+    setDraft(beat.text);
+    setEditing(true);
+  };
+  const cancelEdit = () => {
+    if (saving) return;
+    setEditing(false);
+  };
+  const saveEdit = async () => {
+    const next = draft.trim();
+    if (!next || next === beat.text) {
+      setEditing(false);
+      return;
+    }
+    setSaving(true);
+    try {
+      await onEditText?.(index, next);
+    } finally {
+      setSaving(false);
+      setEditing(false);
+    }
+  };
   const needsChoice =
+    beat.included &&
     !locked &&
     (beat.visualType === "text_card"
       ? !(beat.overlay && beat.overlay.trim())
       : !beat.chosenAssetId && !beat.loading);
 
-  const interactive = !beat.loading && !locked;
+  const canPick = beat.included && !beat.loading && !locked;
+  const canReinclude = !beat.included && !locked && Boolean(onToggleIncluded);
+  // The row is one big target: a kept beat opens the clip picker, a removed
+  // (dimmed) beat is added back. The checkbox is an explicit second affordance.
+  const interactive = canPick || canReinclude;
+  const activate = () => {
+    if (canPick) onOpenPicker(index);
+    else if (canReinclude) onToggleIncluded?.(index);
+  };
 
   return (
     <li
       role={interactive ? "button" : undefined}
       tabIndex={interactive ? 0 : undefined}
-      onClick={interactive ? () => onOpenPicker(index) : undefined}
+      onClick={interactive ? activate : undefined}
       onKeyDown={
         interactive
           ? (e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
-                onOpenPicker(index);
+                activate();
               }
             }
           : undefined
       }
-      aria-label={interactive ? "Change clip" : undefined}
+      aria-label={
+        canPick ? "Change clip" : canReinclude ? "Add this beat back to the video" : undefined
+      }
       className={cn(
-        "group panel flex animate-fade-rise items-start gap-4 p-3 transition-colors hover:border-hairline/90 sm:p-4",
+        "group panel flex animate-fade-rise items-center gap-3 p-3 transition-colors hover:border-hairline/90 sm:gap-4 sm:p-4",
+        !beat.included && "opacity-60",
         interactive &&
-          "cursor-pointer hover:border-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60",
+          "cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60",
+        canPick && "hover:border-accent/40",
+        canReinclude && "hover:border-accent/40 hover:opacity-100",
       )}
       style={{ animationDelay: `${Math.min(index * 35, 500)}ms` }}
     >
-      <div className="relative size-20 shrink-0 sm:size-24">
+      {!locked && onToggleIncluded && (
+        // Generous hit area (the padded button) wrapping a clearly-sized box.
+        <button
+          type="button"
+          role="checkbox"
+          aria-checked={beat.included}
+          aria-label={beat.included ? "Remove this beat from the video" : "Add this beat to the video"}
+          title={beat.included ? "Remove from video" : "Add to video"}
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggleIncluded(index);
+          }}
+          className="-m-1.5 grid shrink-0 place-items-center self-center p-1.5 focus-visible:outline-none"
+        >
+          <span
+            className={cn(
+              "grid size-6 place-items-center rounded-md border-2 transition-all",
+              "group-focus-visible:ring-0",
+              beat.included
+                ? "border-accent bg-accent text-accent-foreground"
+                : "border-faint/70 bg-transparent text-transparent hover:border-cream",
+            )}
+          >
+            <Check className="size-4" strokeWidth={3} />
+          </span>
+        </button>
+      )}
+      <div
+        className={cn(
+          "relative size-20 shrink-0 sm:size-24",
+          !beat.included && "saturate-50",
+        )}
+      >
         <Thumb beat={beat} searching={searching} />
         {needsChoice && (
           <span className="absolute -right-1 -top-1 size-2.5 rounded-full bg-accent ring-2 ring-canvas" />
@@ -189,33 +295,152 @@ export const BeatRow = React.memo(function BeatRow({
               finding clip…
             </span>
           )}
-        </div>
-        <p
-          className={cn(
-            "text-sm leading-relaxed text-cream/90",
-            beat.loading && "text-faint",
+          {!beat.included && (
+            <span className="rounded bg-panel-raised px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-faint">
+              Removed
+            </span>
           )}
-        >
-          {beat.text}
-        </p>
+        </div>
+        {editing ? (
+          <div
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => e.stopPropagation()}
+          >
+            <Textarea
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              rows={2}
+              disabled={saving}
+              className="min-h-0 resize-none py-1.5 text-sm leading-relaxed"
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault();
+                  void saveEdit();
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  cancelEdit();
+                }
+              }}
+              onFocus={(e) => {
+                const len = e.currentTarget.value.length;
+                e.currentTarget.setSelectionRange(len, len);
+              }}
+            />
+            <div className="mt-1.5 flex items-center gap-1.5">
+              <Button
+                size="sm"
+                onClick={() => void saveEdit()}
+                disabled={saving || !draft.trim() || draft.trim() === beat.text}
+              >
+                {saving ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Check className="size-3.5" />
+                )}
+                {saving ? (isAnimated ? "Re-rendering…" : "Saving…") : "Save"}
+              </Button>
+              <Button size="sm" variant="ghost" onClick={cancelEdit} disabled={saving}>
+                <X className="size-3.5" />
+                Cancel
+              </Button>
+              <span className="hidden text-[11px] text-faint sm:inline">
+                {isAnimated
+                  ? "Fixes the text and re-renders the card"
+                  : "Fixes the caption text only"}
+              </span>
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-start gap-1.5">
+            <p
+              className={cn(
+                "min-w-0 flex-1 text-sm leading-relaxed text-cream/90",
+                (beat.loading || !beat.included) && "text-faint",
+                !beat.included && "line-through decoration-faint/60",
+              )}
+            >
+              {showWords
+                ? beat.words!.map((w, i) => (
+                    <React.Fragment key={i}>
+                      {i > 0 && " "}
+                      <span
+                        className={cn(
+                          w.filler && "text-faint line-through decoration-accent/70 decoration-2",
+                        )}
+                      >
+                        {w.text.trim()}
+                      </span>
+                    </React.Fragment>
+                  ))
+                : beat.text}
+            </p>
+            {canEditText && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  startEdit();
+                }}
+                className="mt-0.5 shrink-0 rounded p-1 text-faint opacity-0 transition-opacity hover:bg-panel-raised hover:text-cream focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 group-hover:opacity-100"
+                aria-label="Fix transcription typo"
+                title="Fix transcription typo"
+              >
+                <Pencil className="size-3.5" />
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
-      {!locked && (
+      {onPlayBeat && !beat.loading && (
         <Button
           size="icon-sm"
           variant="ghost"
           className="shrink-0 opacity-60 transition-opacity group-hover:opacity-100"
           onClick={(e) => {
             e.stopPropagation();
-            onOpenPicker(index);
+            onPlayBeat(index);
           }}
-          disabled={beat.loading}
-          aria-label="Change clip"
-          title="Change clip"
+          aria-label="Play this beat"
+          title="Play this beat"
         >
-          <Replace className="size-4" />
+          <Play className="size-4" />
         </Button>
       )}
+
+      {!locked &&
+        (beat.included ? (
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            className="shrink-0 opacity-60 transition-opacity group-hover:opacity-100"
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenPicker(index);
+            }}
+            disabled={beat.loading}
+            aria-label="Change clip"
+            title="Change clip"
+          >
+            <Replace className="size-4" />
+          </Button>
+        ) : onToggleIncluded ? (
+          <Button
+            size="sm"
+            variant="secondary"
+            className="shrink-0"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleIncluded(index);
+            }}
+            aria-label="Add this beat back to the video"
+            title="Add back to video"
+          >
+            <Plus className="size-4" />
+            Add back
+          </Button>
+        ) : null)}
     </li>
   );
 });

@@ -1,13 +1,18 @@
 import type {
+  AnimatedTextConfig,
   Aspect,
   Asset,
   AssetSource,
   Beat,
+  BeatKind,
   ContentTheme,
   Quality,
   VideoJob,
   VisualType,
+  Word,
 } from "./types";
+import type { RelWord } from "./animated-text";
+import { relWordsToWire } from "./animated-text";
 import type { VibeId } from "./vibes";
 import { getPreviewAudioUrl } from "./preview-audio";
 
@@ -38,6 +43,7 @@ type OrchAssignment = {
   attribution?: string | null;
 };
 type OrchCandidate = OrchAssignment & { selected?: boolean };
+type OrchWord = { t: string; s: number; e: number; f?: boolean };
 type OrchBeat = {
   index: number;
   text: string;
@@ -46,6 +52,13 @@ type OrchBeat = {
   queries?: Record<string, unknown> | null;
   assignment?: OrchAssignment | null;
   candidates?: OrchCandidate[];
+  words?: OrchWord[];
+  kind?: string;
+  duration_s?: number | null;
+};
+type OrchBeatsResponse = {
+  beats: OrchBeat[];
+  silence_spans?: [number, number][];
 };
 type OrchStatus =
   | "queued"
@@ -64,8 +77,9 @@ type OrchTheme = { mode?: string | null; vibe?: string | null } | null;
 
 function mapSource(platform?: string | null): AssetSource {
   const p = (platform ?? "").toLowerCase();
+  if (p.includes("animated")) return "animated";
   if (p.includes("wikimedia") || p.includes("wiki")) return "wikimedia";
-  if (p.includes("upload") || p.includes("user") || p.includes("yours")) return "yours";
+  if (p.includes("user_video") || p.includes("upload") || p.includes("yours")) return "yours";
   return "pexels"; // pexels_photo / pixabay_photo / anything else
 }
 
@@ -73,8 +87,10 @@ function candidateId(beatIndex: number, c: OrchCandidate, i: number): string {
   return `o-${beatIndex}-${i}-${(c.media_url ?? c.preview_url ?? "x").slice(-12)}`;
 }
 
-function mapCandidate(beatIndex: number, c: OrchCandidate, i: number): Asset {
+function mapCandidate(beat: OrchBeat, c: OrchCandidate, i: number): Asset {
   const kind = (c.kind ?? "").toLowerCase() === "video" ? "video" : "photo";
+  const platform = (c.platform ?? "").toLowerCase();
+  const isUserVideo = platform.includes("user_video") || platform.includes("upload");
   // A real image thumbnail only exists when preview_url is a distinct image
   // (stock photos, and stock videos whose preview is a still frame). The user's
   // own footage has preview_url === media_url (the video file itself), which is
@@ -82,7 +98,7 @@ function mapCandidate(beatIndex: number, c: OrchCandidate, i: number): Asset {
   // leave thumbUrl empty so the picker renders the video's own first frame.
   const hasImageThumb = Boolean(c.preview_url) && c.preview_url !== c.media_url;
   return {
-    id: candidateId(beatIndex, c, i),
+    id: candidateId(beat.index, c, i),
     thumbUrl: hasImageThumb
       ? (c.preview_url as string)
       : kind === "video"
@@ -92,6 +108,7 @@ function mapCandidate(beatIndex: number, c: OrchCandidate, i: number): Asset {
     kind,
     // Keep the streamable file for videos so the picker can play a preview.
     mediaUrl: kind === "video" ? c.media_url ?? undefined : undefined,
+    sourceInS: kind === "video" && isUserVideo ? beat.start_s : undefined,
   };
 }
 
@@ -105,8 +122,11 @@ function mapVisualType(beat: OrchBeat): VisualType {
 }
 
 function mapBeat(beat: OrchBeat): Beat {
-  const candidates = (beat.candidates ?? []).map((c, i) => mapCandidate(beat.index, c, i));
-  const visualType = mapVisualType(beat);
+  const beatKind: BeatKind = beat.kind === "insert" ? "insert" : "narration";
+  const durationS =
+    beatKind === "insert" && beat.duration_s != null ? Number(beat.duration_s) : undefined;
+  const candidates = (beat.candidates ?? []).map((c, i) => mapCandidate(beat, c, i));
+  const visualType = beatKind === "insert" ? "text_card" : mapVisualType(beat);
   const selectedIdx = (beat.candidates ?? []).findIndex((c) => c.selected);
   const chosenAssetId =
     selectedIdx >= 0
@@ -115,13 +135,22 @@ function mapBeat(beat: OrchBeat): Beat {
   return {
     index: beat.index,
     from: beat.start_s,
-    to: beat.end_s,
+    to: beatKind === "insert" && durationS != null ? beat.start_s + durationS : beat.end_s,
     text: beat.text,
     visualType,
     overlay: visualType === "text_card" ? beat.text.slice(0, 60) : undefined,
-    loading: candidates.length === 0 && visualType !== "text_card",
+    loading: beatKind !== "insert" && candidates.length === 0 && visualType !== "text_card",
+    included: true,
     chosenAssetId,
     candidates,
+    words: (beat.words ?? []).map((w) => ({
+      text: w.t,
+      from: w.s,
+      to: w.e,
+      filler: Boolean(w.f),
+    })),
+    kind: beatKind,
+    durationS,
   };
 }
 
@@ -214,7 +243,9 @@ export async function orchGetVideoJob(id: string): Promise<VideoJob> {
     throw new JobNotFoundError(id);
   }
   const status = await jsonOrThrow(statusRes);
-  const beats: Beat[] = (beatsRes.beats as OrchBeat[]).map(mapBeat);
+  const beatsData = beatsRes as OrchBeatsResponse;
+  const beats: Beat[] = (beatsData.beats ?? []).map(mapBeat);
+  const silenceSpans = beatsData.silence_spans ?? [];
   const s = status.status as OrchStatus;
   const durationSec = beats.length
     ? Math.round(Math.max(...beats.map((b) => b.to)))
@@ -229,6 +260,9 @@ export async function orchGetVideoJob(id: string): Promise<VideoJob> {
     quality: "standard",
     captions: true,
     music: false,
+    removeSilence: false,
+    removeFillers: false,
+    silenceSpans,
     theme: mapTheme(status.theme as OrchTheme),
     // The whole window before the clip search starts. Output choices can be
     // committed any time here (POST /prepare) — even while transcription is
@@ -248,21 +282,36 @@ export async function orchGetVideoJob(id: string): Promise<VideoJob> {
 
 export async function orchStartRender(
   id: string,
-  opts?: { overrides?: Record<number, number>; aspect?: Aspect; captions?: boolean },
+  opts?: {
+    overrides?: Record<number, number>;
+    excludedBeats?: number[];
+    aspect?: Aspect;
+    captions?: boolean;
+    removeSilence?: boolean;
+    removeFillers?: boolean;
+  },
 ): Promise<void> {
   // Send the final output choices with the render call so swaps made on the
   // Pick Clips screen (clip, aspect, captions) are honored — the orchestrator
   // folds these into the job payload before encoding. See docs/IMPROVEMENTS.md.
   const body: {
     overrides?: Record<number, number>;
+    excluded_beats?: number[];
     format?: string;
     subtitles?: boolean;
+    remove_silence?: boolean;
+    remove_fillers?: boolean;
   } = {};
   if (opts?.overrides && Object.keys(opts.overrides).length > 0) {
     body.overrides = opts.overrides;
   }
+  if (opts?.excludedBeats !== undefined) {
+    body.excluded_beats = opts.excludedBeats;
+  }
   if (opts?.aspect) body.format = ASPECT_FORMAT[opts.aspect];
   if (opts?.captions !== undefined) body.subtitles = opts.captions;
+  if (opts?.removeSilence !== undefined) body.remove_silence = opts.removeSilence;
+  if (opts?.removeFillers !== undefined) body.remove_fillers = opts.removeFillers;
 
   const hasBody = Object.keys(body).length > 0;
   await jsonOrThrow(
@@ -333,6 +382,98 @@ export async function orchSearchClips(
 ): Promise<Asset[]> {
   const { makeSearchResults } = await import("./mock");
   return makeSearchResults(beatIndex, query);
+}
+
+/**
+ * Insert a brand-new standalone animated text-card beat at ``position``. Existing
+ * beats at/after it shift up; callers should re-fetch the job afterwards.
+ */
+export async function orchInsertAnimatedBeat(
+  id: string,
+  position: number,
+  text: string,
+  durationS: number,
+  blob: Blob,
+  config: AnimatedTextConfig,
+  words: RelWord[],
+): Promise<{ beatIndex: number; mediaUrl: string | null }> {
+  const form = new FormData();
+  const ext = blob.type.includes("mp4") ? "mp4" : "webm";
+  form.append("clip", blob, `insert-${position}.${ext}`);
+  form.append("position", String(position));
+  form.append("text", text);
+  form.append("duration_s", String(durationS));
+  form.append("style", config.style);
+  form.append("palette", config.palette);
+  form.append("sound", config.sound);
+  form.append("words", JSON.stringify(relWordsToWire(words)));
+  const data = await jsonOrThrow(
+    await fetch(`/api/videos/${id}/beats/insert`, {
+      method: "POST",
+      body: form,
+    }),
+  );
+  return {
+    beatIndex: Number(data.beat_index ?? position),
+    mediaUrl: (data.media_url as string | null) ?? null,
+  };
+}
+
+/**
+ * Upload a browser-recorded animated text-card clip for one beat. The backend
+ * stores it and registers it as a selected candidate; we return the candidate
+ * index so the render override can re-select it, plus the stored media URL.
+ */
+export async function orchUploadAnimatedClip(
+  id: string,
+  beatIndex: number,
+  blob: Blob,
+  config: AnimatedTextConfig,
+): Promise<{ candidateIndex: number; mediaUrl: string | null }> {
+  const form = new FormData();
+  const ext = blob.type.includes("mp4") ? "mp4" : "webm";
+  form.append("clip", blob, `beat-${beatIndex}.${ext}`);
+  form.append("style", config.style);
+  form.append("palette", config.palette);
+  form.append("sound", config.sound);
+  const data = await jsonOrThrow(
+    await fetch(`/api/videos/${id}/beats/${beatIndex}/clip`, {
+      method: "POST",
+      body: form,
+    }),
+  );
+  return {
+    candidateIndex: Number(data.candidate_index ?? 0),
+    mediaUrl: (data.media_url as string | null) ?? null,
+  };
+}
+
+/**
+ * Correct a beat's transcript text (a typo fix). Only the caption text changes;
+ * the backend re-syncs per-word timing when the word count is unchanged and
+ * returns the updated words so the editor stays consistent.
+ */
+export async function orchUpdateBeatText(
+  id: string,
+  beatIndex: number,
+  text: string,
+): Promise<{ text: string; words: Word[] }> {
+  const data = await jsonOrThrow(
+    await fetch(`/api/videos/${id}/beats/${beatIndex}/text`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    }),
+  );
+  const words = (Array.isArray(data.words) ? data.words : []).map(
+    (w: OrchWord) => ({
+      text: w.t,
+      from: w.s,
+      to: w.e,
+      filler: Boolean(w.f),
+    }),
+  );
+  return { text: (data.text as string) ?? text, words };
 }
 
 export async function orchUploadOwnClip(

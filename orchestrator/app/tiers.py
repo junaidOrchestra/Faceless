@@ -18,8 +18,16 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
-Tier = Literal["free", "individual", "professional"]
-TIERS: tuple[Tier, ...] = ("free", "individual", "professional")
+# "admin" is an internal-only tier (never advertised, no UI to obtain it). It is
+# assigned out-of-band (set users.tier = 'admin' directly in the DB). It is a
+# valid value of ``Tier`` so get_tier_config/enforcement recognize it, but it is
+# deliberately excluded from ``PUBLIC_TIERS`` so it never appears in any public
+# listing/pricing surface.
+Tier = Literal["free", "individual", "professional", "admin"]
+# Tiers users can actually sign up for / see. Admin is intentionally absent.
+PUBLIC_TIERS: tuple[Tier, ...] = ("free", "individual", "professional")
+# Backwards-compatible alias (older imports).
+TIERS: tuple[Tier, ...] = PUBLIC_TIERS
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +51,14 @@ class TierConfig:
         daily_uploads: Maximum POST /videos (create/upload) requests per rolling
             day. ``0`` = unlimited. Caps the upstream transcribe/LLM/clip cost a
             single account can incur per day.
+        unlimited_credits: When True, renders are never charged and the balance
+            is never the gate (the credit pre-check + deduction are skipped).
+            Used by the internal ``admin`` tier.
         features: Free-form capability flags surfaced to the UI.
+
+    Note: ``max_video_seconds == 0`` means "no length limit" (see
+    :func:`check_video_length`), matching the ``0 == unlimited`` convention used
+    by the other caps.
     """
 
     name: Tier
@@ -56,6 +71,7 @@ class TierConfig:
     max_projects: int = 0
     max_concurrent_jobs: int = 0
     daily_uploads: int = 0
+    unlimited_credits: bool = False
 
 
 # --- The one editable place ------------------------------------------------
@@ -98,6 +114,28 @@ TIER_CONFIG: dict[Tier, TierConfig] = {
             "stock_clips",
             "captions",
             "no_watermark",
+            "hd_export",
+            "4k_export",
+            "priority_render",
+        ),
+    ),
+    # Internal-only tier. Not advertised, no self-serve path to obtain it; assign
+    # by setting users.tier = 'admin' in the DB. Unlimited credits + no length
+    # limit, but the watermark is intentionally kept on.
+    "admin": TierConfig(
+        name="admin",
+        label="Admin",
+        monthly_credits=0,  # unused: unlimited_credits short-circuits charging
+        max_video_seconds=0,  # 0 = no length limit
+        max_resolution_height=2160,
+        watermark=True,
+        max_projects=0,  # unlimited
+        max_concurrent_jobs=0,  # unlimited
+        daily_uploads=0,  # unlimited
+        unlimited_credits=True,
+        features=(
+            "stock_clips",
+            "captions",
             "hd_export",
             "4k_export",
             "priority_render",
@@ -146,7 +184,8 @@ def check_video_length(tier: str | None, seconds: float) -> LimitViolation | Non
     """Return a violation if ``seconds`` exceeds the tier's max video length."""
 
     cfg = get_tier_config(tier)
-    if seconds > cfg.max_video_seconds:
+    # max_video_seconds == 0 means "no limit" (e.g. the admin tier).
+    if cfg.max_video_seconds and seconds > cfg.max_video_seconds:
         return LimitViolation(
             code="video_too_long",
             message=(

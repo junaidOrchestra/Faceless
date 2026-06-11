@@ -10,6 +10,7 @@ import {
   LogIn,
   LogOut,
   Menu,
+  MessageSquareHeart,
   Plus,
   Sparkles,
   Tag,
@@ -19,6 +20,7 @@ import {
 } from "lucide-react";
 import { Brand } from "@/components/brand";
 import { Button } from "@/components/ui/button";
+import { useFeedbackStore } from "@/lib/feedback-store";
 import { createClient } from "@/lib/supabase/client";
 import { useMe } from "@/lib/use-me";
 import { cn } from "@/lib/utils";
@@ -52,6 +54,7 @@ export function AppMenu({ className }: { className?: string }) {
   const pathname = usePathname();
   const router = useRouter();
   const { me } = useMe();
+  const openFeedback = useFeedbackStore((s) => s.setOpen);
 
   // Close on client-side navigation (covers programmatic pushes too).
   React.useEffect(() => {
@@ -140,6 +143,28 @@ export function AppMenu({ className }: { className?: string }) {
                 );
               })}
             </ul>
+
+            {me && (
+              <>
+                <div className="my-3 h-px bg-hairline/60" />
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOpen(false);
+                    openFeedback(true);
+                  }}
+                  className="group flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left text-faint transition-colors hover:bg-panel-raised hover:text-cream"
+                >
+                  <MessageSquareHeart className="mt-0.5 size-5 shrink-0 text-faint group-hover:text-accent" />
+                  <span className="min-w-0">
+                    <span className="block text-sm font-medium">Send feedback</span>
+                    <span className="block text-xs text-faint">
+                      Suggest features & report issues
+                    </span>
+                  </span>
+                </button>
+              </>
+            )}
           </nav>
 
           <div className="border-t border-hairline p-3">
@@ -163,7 +188,7 @@ export function AppMenu({ className }: { className?: string }) {
                     </span>
                     <span className="inline-flex items-center gap-1 rounded-full border border-hairline px-2 py-0.5 text-xs font-medium text-cream">
                       <Zap className="size-3 text-accent" />
-                      {me.credits}
+                      {me.tier_info.unlimited_credits ? "∞" : me.credits}
                     </span>
                   </Link>
                 </Dialog.Close>

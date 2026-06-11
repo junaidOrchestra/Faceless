@@ -1,8 +1,19 @@
 import { create } from "zustand";
-import type { Asset, Aspect, Beat, Quality, VideoJob } from "./types";
-import { getVideoJob, prepareJob, startRender, type RenderSettings } from "./api";
+import type { AnimatedTextConfig, Asset, Aspect, Beat, Quality, VideoJob } from "./types";
+import type { RelWord } from "./animated-text";
+import {
+  getVideoJob,
+  insertAnimatedBeat as insertAnimatedBeatApi,
+  prepareJob,
+  startRender,
+  updateBeatText as updateBeatTextApi,
+  uploadAnimatedClip as uploadAnimatedClipApi,
+  type RenderSettings,
+} from "./api";
+import { ASPECT_DIMS } from "./animated-text";
 import { JobNotFoundError } from "./orchestrator";
 import { forgetPreviewAudio } from "./preview-audio";
+import { resyncWords } from "./utils";
 
 type EditorState = {
   job: VideoJob | null;
@@ -17,10 +28,34 @@ type EditorState = {
   prepare: () => Promise<void>;
   render: () => Promise<void>;
   chooseAsset: (beatIndex: number, assetId: string) => void;
+  toggleBeat: (beatIndex: number) => void;
+  setAllBeatsIncluded: (included: boolean) => void;
   addCandidate: (beatIndex: number, asset: Asset, select?: boolean) => void;
+  insertAnimatedBeat: (
+    position: number,
+    text: string,
+    durationS: number,
+    blob: Blob,
+    config: AnimatedTextConfig,
+    words: RelWord[],
+  ) => Promise<void>;
   setOverlay: (beatIndex: number, overlay: string) => void;
+  editBeatText: (beatIndex: number, text: string) => Promise<void>;
+  /** Re-record the beat's animated text card with its current text/config. */
+  rerecordAnimatedCard: (beatIndex: number) => Promise<void>;
   updateSettings: (
-    patch: Partial<Pick<VideoJob, "aspect" | "quality" | "captions" | "music" | "theme">>,
+    patch: Partial<
+      Pick<
+        VideoJob,
+        | "aspect"
+        | "quality"
+        | "captions"
+        | "music"
+        | "theme"
+        | "removeSilence"
+        | "removeFillers"
+      >
+    >,
   ) => void;
 };
 
@@ -29,7 +64,9 @@ function releaseLocalAssetUrls(job: VideoJob | null): void {
   const seen = new Set<string>();
   for (const beat of job.beats) {
     for (const asset of beat.candidates) {
-      if (asset.source !== "yours") continue;
+      // Local blob URLs we created: user-library uploads and recorded animated
+      // text cards. Stock clips are remote http URLs (nothing to revoke).
+      if (asset.source !== "yours" && asset.source !== "animated") continue;
       for (const url of [asset.thumbUrl, asset.mediaUrl]) {
         if (url?.startsWith("blob:") && !seen.has(url)) {
           seen.add(url);
@@ -70,6 +107,8 @@ function seedJob(id: string): VideoJob {
     quality: "standard",
     captions: true,
     music: false,
+    removeSilence: false,
+    removeFillers: false,
     theme: { mode: "script" },
     awaitingSetup: true,
   };
@@ -133,6 +172,11 @@ function mergeJob(prev: VideoJob | null, incoming: VideoJob): VideoJob {
     quality: prev.quality,
     captions: prev.captions,
     music: prev.music,
+    // Tighten-audio toggles are local choices; keep them across polls. Silence
+    // spans are server-derived, so take fresh data when present.
+    removeSilence: prev.removeSilence,
+    removeFillers: prev.removeFillers,
+    silenceSpans: incoming.silenceSpans ?? prev.silenceSpans,
     // Theme stickiness. A vibe is ONLY ever produced by an explicit user choice
     // — the server never invents one and reports the default {mode:"script"}
     // until /prepare persists the pick. There's a window right after the user
@@ -150,6 +194,24 @@ function mergeJob(prev: VideoJob | null, incoming: VideoJob): VideoJob {
     awaitingSetup: prev.prepared ? false : incoming.awaitingSetup,
     fileName: prev.fileName ?? incoming.fileName,
     durationSec: incoming.durationSec ?? prev.durationSec,
+    audioUrl: prev.audioUrl ?? incoming.audioUrl,
+  };
+}
+
+function preserveLocalJobState(prev: VideoJob, incoming: VideoJob): VideoJob {
+  return {
+    ...incoming,
+    aspect: prev.aspect,
+    quality: prev.quality,
+    captions: prev.captions,
+    music: prev.music,
+    removeSilence: prev.removeSilence,
+    removeFillers: prev.removeFillers,
+    silenceSpans: incoming.silenceSpans ?? prev.silenceSpans,
+    theme: prev.theme,
+    prepared: prev.prepared || incoming.prepared,
+    awaitingSetup: prev.prepared ? false : incoming.awaitingSetup,
+    fileName: prev.fileName ?? incoming.fileName,
     audioUrl: prev.audioUrl ?? incoming.audioUrl,
   };
 }
@@ -295,7 +357,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
 
     render: async () => {
       const { job } = get();
-      if (!job) return;
+      if (!job || keptBeats(job).length === 0) return;
       // Optimistically flip into the render phase so the UI swaps to the render
       // panel immediately (and a re-render clears a previous result).
       activeId = job.id;
@@ -312,9 +374,11 @@ export const useEditorStore = create<EditorState>((set, get) => {
         aspect: job.aspect,
         captions: job.captions,
         music: job.music,
+        removeSilence: job.removeSilence,
+        removeFillers: job.removeFillers,
       };
       try {
-        await startRender(job.id, settings, renderOverrides(job));
+        await startRender(job.id, settings, renderOverrides(job), renderExcluded(job));
       } catch (e) {
         // Surface the orchestrator's reason (e.g. "Video is 95s but the Free
         // tier allows at most 60s" or an insufficient-credits message) instead
@@ -348,6 +412,20 @@ export const useEditorStore = create<EditorState>((set, get) => {
       set({ job: mutateBeat(job, beatIndex, (b) => ({ ...b, chosenAssetId: assetId })) });
     },
 
+    toggleBeat: (beatIndex) => {
+      const { job } = get();
+      if (!job) return;
+      set({
+        job: mutateBeat(job, beatIndex, (b) => ({ ...b, included: !b.included })),
+      });
+    },
+
+    setAllBeatsIncluded: (included) => {
+      const { job } = get();
+      if (!job) return;
+      set({ job: { ...job, beats: job.beats.map((b) => ({ ...b, included })) } });
+    },
+
     addCandidate: (beatIndex, asset, select = true) => {
       const { job } = get();
       if (!job) return;
@@ -360,10 +438,128 @@ export const useEditorStore = create<EditorState>((set, get) => {
       });
     },
 
+    insertAnimatedBeat: async (position, text, durationS, blob, config, words) => {
+      const { job } = get();
+      if (!job) return;
+      await insertAnimatedBeatApi(job.id, position, text, durationS, blob, config, words);
+      const incoming = await getVideoJob(job.id);
+      const current = get().job ?? job;
+      set({ job: preserveLocalJobState(current, incoming) });
+    },
+
     setOverlay: (beatIndex, overlay) => {
       const { job } = get();
       if (!job) return;
       set({ job: mutateBeat(job, beatIndex, (b) => ({ ...b, overlay })) });
+    },
+
+    editBeatText: async (beatIndex, text) => {
+      const { job } = get();
+      if (!job) return;
+      const beat = job.beats.find((b) => b.index === beatIndex);
+      if (!beat) return;
+      const clean = text.trim();
+      if (!clean || clean === beat.text) return;
+
+      const prevText = beat.text;
+      const prevWords = beat.words;
+      // Optimistic: captions/text update instantly; per-word timing is re-mapped
+      // when the word count is unchanged (a pure typo fix).
+      set({
+        job: mutateBeat(job, beatIndex, (b) => ({
+          ...b,
+          text: clean,
+          words: resyncWords(b.words, clean),
+        })),
+      });
+
+      try {
+        const res = await updateBeatTextApi(job.id, beatIndex, clean, prevWords);
+        const current = get().job;
+        if (!current) return;
+        set({
+          job: mutateBeat(current, beatIndex, (b) => ({
+            ...b,
+            text: res.text,
+            words: res.words.length > 0 ? res.words : b.words,
+          })),
+        });
+      } catch {
+        // Roll back to the original text on failure.
+        const current = get().job;
+        if (current) {
+          set({
+            job: mutateBeat(current, beatIndex, (b) => ({
+              ...b,
+              text: prevText,
+              words: prevWords,
+            })),
+          });
+        }
+        return;
+      }
+
+      // Animated text cards bake the text into a recorded video clip (and their
+      // burned captions are suppressed), so a text-only edit is invisible. When
+      // the corrected beat's chosen visual is such a card, re-record it with the
+      // corrected text — same style/sound/duration — so the fix is actually seen.
+      await get().rerecordAnimatedCard(beatIndex);
+    },
+
+    rerecordAnimatedCard: async (beatIndex) => {
+      const job = get().job;
+      if (!job) return;
+      const beat = job.beats.find((b) => b.index === beatIndex);
+      if (!beat) return;
+      const asset = findChosenAsset(beat);
+      if (!asset || asset.source !== "animated" || !asset.animated) return;
+
+      const recorder = await import("./animated-recorder");
+      if (!recorder.animatedRecordingSupported()) return;
+
+      const isInsert = (beat.kind ?? "narration") === "insert";
+      const durationS = Math.max(
+        0.6,
+        isInsert ? beat.durationS ?? beat.to - beat.from : beat.to - beat.from,
+      );
+      // Build the card's words from the CORRECTED text. When the word count is
+      // unchanged we keep the original per-word timing (a true typo fix); if the
+      // count changed we evenly distribute the new words across the duration so
+      // the card always shows the fixed text rather than stale word data.
+      const tokens = beat.text.trim().split(/\s+/).filter(Boolean);
+      const timed = (beat.words ?? []).filter((w) => w.text.trim());
+      let words: RelWord[];
+      if (tokens.length > 0 && timed.length === tokens.length) {
+        const base = isInsert ? 0 : beat.from;
+        words = timed.map((w, i) => ({
+          text: tokens[i],
+          from: Math.max(0, w.from - base),
+          to: Math.max(0, w.to - base),
+        }));
+      } else {
+        const span = tokens.length ? durationS / tokens.length : durationS;
+        words = tokens.map((t, i) => ({ text: t, from: i * span, to: (i + 1) * span }));
+      }
+      const dims = ASPECT_DIMS[job.aspect];
+      try {
+        const { blob } = await recorder.recordAnimatedClip({
+          width: dims.w,
+          height: dims.h,
+          config: asset.animated,
+          words,
+          durationS,
+        });
+        const newAsset = await uploadAnimatedClipApi(
+          job.id,
+          beatIndex,
+          blob,
+          asset.animated,
+        );
+        get().addCandidate(beatIndex, newAsset, true);
+      } catch {
+        // Re-record failed — the text is still corrected in the transcript; the
+        // old card stays so the user can retry from the clip picker.
+      }
     },
 
     updateSettings: (patch) => {
@@ -379,15 +575,115 @@ export const useEditorStore = create<EditorState>((set, get) => {
 // --- Derived selectors ------------------------------------------------------
 
 export function beatNeedsChoice(b: Beat): boolean {
+  if (!b.included) return false;
   if (b.visualType === "text_card") return !(b.overlay && b.overlay.trim().length > 0);
   return !b.chosenAssetId;
 }
 
+export function keptBeats(job: VideoJob | null): Beat[] {
+  if (!job) return [];
+  return job.beats.filter((b) => b.included);
+}
+
+// Kept gap after each shortened pause (seconds). Mirrors MIN_SILENCE_KEEP_S in
+// app/timeline.py so the previewed duration matches the rendered output.
+const MIN_SILENCE_KEEP_S = 0.3;
+
+/** Subtract `cuts` intervals from `base` intervals (mirrors app/timeline.py). */
+function subtractSpans(
+  base: [number, number][],
+  cuts: [number, number][],
+): [number, number][] {
+  if (cuts.length === 0) return base.filter(([s, e]) => e > s);
+  const merged = [...cuts]
+    .map(([s, e]) => [Math.min(s, e), Math.max(s, e)] as [number, number])
+    .sort((a, b) => a[0] - b[0])
+    .reduce<[number, number][]>((acc, [s, e]) => {
+      const last = acc[acc.length - 1];
+      if (last && s <= last[1]) last[1] = Math.max(last[1], e);
+      else acc.push([s, e]);
+      return acc;
+    }, []);
+  const out: [number, number][] = [];
+  for (const [segStart, segEnd] of base) {
+    let cursor = segStart;
+    for (const [cutStart, cutEnd] of merged) {
+      if (cutEnd <= cursor || cutStart >= segEnd) continue;
+      if (cutStart > cursor) out.push([cursor, Math.min(cutStart, segEnd)]);
+      cursor = Math.max(cursor, cutEnd);
+      if (cursor >= segEnd) break;
+    }
+    if (cursor < segEnd) out.push([cursor, segEnd]);
+  }
+  return out.filter(([s, e]) => e > s);
+}
+
+/**
+ * Output video duration in seconds for the CURRENT selection, mirroring the
+ * orchestrator's timeline math (see app/timeline.py): each kept beat's window
+ * runs from its own start to the next beat's start (gapless), unless "remove
+ * silences" is on (then only the spoken span counts and detected pauses are
+ * cut), and "remove fillers" further drops flagged words. Equals the full
+ * narration length when nothing is excluded or tightened.
+ */
+export function renderDurationSec(job: VideoJob | null): number {
+  if (!job || job.beats.length === 0) return 0;
+  const beats = [...job.beats].sort((a, b) => a.index - b.index);
+  const narration = beats.filter((b) => (b.kind ?? "narration") !== "insert");
+  if (narration.length === 0) {
+    return beats
+      .filter((b) => b.included)
+      .reduce((sum, b) => sum + Math.max(0.2, b.durationS ?? b.to - b.from), 0);
+  }
+  const audioEnd = Math.max(...narration.map((b) => b.to));
+  const boundaries: number[] = [0];
+  for (let i = 1; i < narration.length; i++) boundaries.push(narration[i].from);
+  boundaries.push(Math.max(audioEnd, narration[narration.length - 1].to));
+  for (let i = 1; i < boundaries.length; i++) {
+    if (boundaries[i] < boundaries[i - 1]) boundaries[i] = boundaries[i - 1];
+  }
+  const silenceSpans = (job.silenceSpans ?? []) as [number, number][];
+  let total = 0;
+  let narrationPos = 0;
+  for (const beat of beats) {
+    if ((beat.kind ?? "narration") === "insert") {
+      if (!beat.included) continue;
+      total += Math.max(0.2, beat.durationS ?? beat.to - beat.from);
+      continue;
+    }
+    const i = narrationPos;
+    narrationPos += 1;
+    if (!beat.included) continue;
+    // Always the gapless boundary window; "remove silences" only shortens
+    // detected pauses to a small kept gap (mirrors app/timeline.py).
+    const base: [number, number][] = [[boundaries[i], boundaries[i + 1]]];
+    const cuts: [number, number][] = [];
+    if (job.removeSilence) {
+      for (const [ss, se] of silenceSpans) {
+        const cutStart = ss + MIN_SILENCE_KEEP_S;
+        if (se > cutStart) cuts.push([cutStart, se]);
+      }
+    }
+    if (job.removeFillers && beat.words) {
+      for (const w of beat.words) if (w.filler) cuts.push([w.from, w.to]);
+    }
+    const spans = cuts.length ? subtractSpans(base, cuts) : base;
+    for (const [s, e] of spans) total += Math.max(0, e - s);
+  }
+  return total;
+}
+
 export function chosenCount(job: VideoJob | null): { chosen: number; total: number } {
   if (!job) return { chosen: 0, total: 0 };
-  const total = job.beats.length;
-  const chosen = job.beats.filter((b) => !beatNeedsChoice(b) && !b.loading).length;
+  const active = keptBeats(job);
+  const total = active.length;
+  const chosen = active.filter((b) => !beatNeedsChoice(b) && !b.loading).length;
   return { chosen, total };
+}
+
+export function renderExcluded(job: VideoJob | null): number[] {
+  if (!job) return [];
+  return job.beats.filter((b) => !b.included).map((b) => b.index);
 }
 
 export function findChosenAsset(beat: Beat): Asset | null {

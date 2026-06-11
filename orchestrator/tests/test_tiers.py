@@ -20,6 +20,18 @@ def test_check_video_length_unit() -> None:
     assert tiers.check_video_length("free", 30) is None
     # Higher tiers allow longer videos.
     assert tiers.check_video_length("professional", 120) is None
+    # Admin has no length limit (max_video_seconds == 0).
+    assert tiers.check_video_length("admin", 99999) is None
+
+
+def test_admin_tier_internal_only() -> None:
+    cfg = tiers.get_tier_config("admin")
+    assert cfg.unlimited_credits is True
+    assert cfg.watermark is True
+    assert cfg.max_video_seconds == 0
+    # Hidden from every public listing.
+    assert "admin" not in tiers.PUBLIC_TIERS
+    assert "admin" not in tiers.TIERS
 
 
 def test_credit_cost_rounds_up() -> None:

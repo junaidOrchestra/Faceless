@@ -80,9 +80,27 @@ export default function AccountPage() {
             </div>
 
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-              <Stat label="Credits" value={String(me.credits)} accent />
-              <Stat label="Monthly grant" value={String(me.tier_info.monthly_credits)} />
-              <Stat label="Max length" value={`${me.tier_info.max_video_seconds}s`} />
+              <Stat
+                label="Credits"
+                value={me.tier_info.unlimited_credits ? "Unlimited" : String(me.credits)}
+                accent
+              />
+              <Stat
+                label="Monthly grant"
+                value={
+                  me.tier_info.unlimited_credits
+                    ? "Unlimited"
+                    : String(me.tier_info.monthly_credits)
+                }
+              />
+              <Stat
+                label="Max length"
+                value={
+                  me.tier_info.max_video_seconds > 0
+                    ? `${me.tier_info.max_video_seconds}s`
+                    : "No limit"
+                }
+              />
               <Stat
                 label="Max quality"
                 value={`${me.tier_info.max_resolution_height}p`}
