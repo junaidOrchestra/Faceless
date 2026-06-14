@@ -15,6 +15,7 @@ import {
   getCachedNarration,
   getSharedAudioCtx,
 } from "@/lib/preview-audio";
+import { useLocalFootageUrl } from "@/lib/use-local-footage";
 import { cn } from "@/lib/utils";
 
 export type Scene = {
@@ -34,6 +35,13 @@ export type Scene = {
   // leave a silent gap in the narration while their own SFX/video plays.
   skipNarration?: boolean;
   suppressCaptions?: boolean;
+  // True when the clip is the user's own uploaded footage. Such scenes are
+  // played from the local file (resolved at render time) instead of `src`.
+  isUserFootage?: boolean;
+  // True only for stock b-roll that is shorter than its beat: it loops to fill
+  // the slot. Animated text cards and user footage are exactly beat-length (or
+  // longer) and must play once — looping replays the text, which looks wrong.
+  loopClip?: boolean;
 };
 
 export function beatToScene(beat: Beat): Scene {
@@ -57,6 +65,16 @@ export function beatToScene(beat: Beat): Scene {
       hasOwnAudio: asset.source === "animated",
       skipNarration: isInsert,
       suppressCaptions: asset.source === "animated",
+      // The whole-video upload is the only "yours" asset the orchestrator tags
+      // with an in-point (sourceInS); per-beat library uploads don't get one, so
+      // this won't mis-target them with the main footage URL.
+      isUserFootage: asset.source === "yours" && asset.sourceInS !== undefined,
+      // Only stock b-roll loops to fill the beat. Animated text cards (their own
+      // recorded clip) and user footage must play through once, not on repeat.
+      loopClip:
+        asset.source !== "animated" &&
+        asset.source !== "yours" &&
+        asset.sourceInS === undefined,
     };
   }
   if (beat.visualType === "text_card") {
@@ -158,7 +176,17 @@ export function PreviewPlayer({
     return job.beats.filter((b) => b.included).map(beatToScene);
   }, [job.beats, beatIndex]);
   const hasContent = scenes.length > 0;
-  const canUseAudio = Boolean(job.audioUrl);
+  // Play the user's own footage from the local file (rehydrated from IndexedDB
+  // if needed) rather than the cloud copy. Cloud `src` stays the fallback.
+  const localFootageUrl = useLocalFootageUrl(job.id, job.isVideo);
+  // For an uploaded video the footage <video> element IS the audio source: its
+  // own track carries the narration and plays in sync for free. We deliberately
+  // do NOT route it through Web Audio — decoding a full (often 100+ MB) upload to
+  // an AudioBuffer is slow, memory-heavy, and silently fails for many codecs,
+  // which is exactly what left the preview stuck on "loading audio…". Web Audio
+  // narration is reserved for audio-only jobs (no single footage track to play).
+  const preferFootageAudio = Boolean(job.isVideo);
+  const canUseAudio = Boolean(job.audioUrl) && !preferFootageAudio;
   const firstSceneStart = scenes[0]?.startS ?? 0;
   const hasNarrationGaps = scenes.some((s) => s.skipNarration);
 
@@ -171,6 +199,10 @@ export function PreviewPlayer({
   const [elementFailed, setElementFailed] = React.useState(false);
   const [audioReady, setAudioReady] = React.useState(false);
   const videoRef = React.useRef<HTMLVideoElement>(null);
+  // Overlay visual for video jobs: the animated card / b-roll clip shown ON TOP
+  // of the (audible, possibly hidden) footage bed. Muted — the audio always
+  // comes from the footage bed so the user hears the original video.
+  const overlayRef = React.useRef<HTMLVideoElement>(null);
   const audioRef = React.useRef<HTMLAudioElement>(null);
   const idxRef = React.useRef(0);
   const lastClockCommitRef = React.useRef(0);
@@ -367,6 +399,7 @@ export function PreviewPlayer({
       stopAllSources();
       audioRef.current?.pause();
       videoRef.current?.pause();
+      overlayRef.current?.pause();
       setPlaying(false);
       setIdx(0);
       idxRef.current = 0;
@@ -393,6 +426,47 @@ export function PreviewPlayer({
       if (!a) {
         raf = requestAnimationFrame(loop);
         return;
+      }
+      // For uploaded-video jobs the footage <video> is a continuous audio bed and
+      // the master clock: its own track is the narration, and it keeps playing on
+      // every narration beat — even one whose picture was swapped to b-roll or a
+      // text card (those render as muted overlays on top). A free-running perf
+      // timer drifts ahead of the real media (decode/startup latency), switching
+      // scenes early and clipping the final word; re-anchoring to el.currentTime
+      // each frame keeps the timeline locked to what's audible. Only standalone
+      // silent inserts (skipNarration) pause the bed and fall back to perf time.
+      const el = videoRef.current;
+      const curIdx = idxRef.current;
+      const curSeg = segs[curIdx];
+      if (
+        preferFootageAudio &&
+        el &&
+        el.readyState >= 2 &&
+        curSeg &&
+        !curSeg.scene.skipNarration
+      ) {
+        const mediaTime = el.currentTime;
+        const mediaSegIndex = segs.findIndex(({ scene, dur }) => {
+          if (scene.skipNarration) return false;
+          const mediaStart = scene.sourceInS ?? scene.startS;
+          return mediaTime >= mediaStart - 0.03 && mediaTime < mediaStart + dur - 0.03;
+        });
+        const mediaSeg = mediaSegIndex >= 0 ? segs[mediaSegIndex] : curSeg;
+        const mediaStart = mediaSeg.scene.sourceInS ?? mediaSeg.scene.startS;
+        const mediaEnd = mediaStart + mediaSeg.dur;
+        if (mediaSegIndex >= 0) {
+          a.virtual = mediaSeg.offset + (mediaTime - mediaStart);
+        } else if (mediaTime >= mediaEnd - 0.02 && curIdx + 1 < segs.length) {
+          const nextSeg = segs[curIdx + 1];
+          if (!nextSeg.scene.skipNarration) {
+            const nextMediaStart = nextSeg.scene.sourceInS ?? nextSeg.scene.startS;
+            if (Math.abs(mediaTime - nextMediaStart) > 0.05) {
+              el.currentTime = nextMediaStart;
+            }
+            a.virtual = nextSeg.offset;
+          }
+        }
+        if (a.mode === "silent") a.perf = performance.now();
       }
       const v =
         a.mode === "audio" && audioCtxRef.current
@@ -422,7 +496,7 @@ export function PreviewPlayer({
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [playing, hasContent, useElement, segs, totalDur, idxForVirtual, stopAndReset]);
+  }, [playing, hasContent, useElement, segs, totalDur, idxForVirtual, stopAndReset, preferFootageAudio]);
 
   // Element-fallback loop: the <audio> element plays the whole file along the
   // ORIGINAL timeline, so we advance scene-by-scene and seek across the excluded
@@ -491,22 +565,74 @@ export function PreviewPlayer({
   }, [playing, hasContent, useElement, scenes, stopAndReset]);
 
   const scene = hasContent ? scenes[Math.min(idx, scenes.length - 1)] : null;
+  // For an uploaded video the footage element is a continuous audio + picture
+  // bed: its own track is the narration. We key it on the footage FILE (not the
+  // scene) so it plays start-to-finish without remounting, staying audible even
+  // on beats whose picture was swapped to b-roll or a text card — those render
+  // as muted overlays on top of it (so the user always hears the original
+  // video). Prefer the browser-local file; fall back to the cloud copy.
+  const footageBedSrc = React.useMemo(
+    () => localFootageUrl ?? scenes.find((s) => s.isUserFootage)?.src,
+    [localFootageUrl, scenes],
+  );
+  const sceneIsFootage = Boolean(scene?.isUserFootage);
+  // The footage bed's own track plays for every narration beat (shown or
+  // overlaid); only a standalone silent insert (skipNarration) mutes/pauses it.
+  const footageBedAudible = Boolean(scene && !scene.skipNarration);
+  // The on-screen element is unmuted when it carries the audio we want heard.
+  // Video jobs: the footage bed on narration beats. Other jobs: an animated
+  // card's baked-in SFX.
+  const sceneHasAudio = preferFootageAudio
+    ? footageBedAudible
+    : Boolean(scene?.hasOwnAudio);
+  // Per-scene <video> source for NON-video jobs (stock b-roll / animated). Video
+  // jobs use the persistent footage bed + overlay instead.
+  const videoSrc =
+    !preferFootageAudio && scene?.kind === "video" ? scene.src : undefined;
 
-  // Keep the on-screen <video> in lockstep with playback state: (re)start it
-  // from the scene's in-point when playing (and on each scene change), and pause
-  // it whenever the rough cut is paused. Driving it from `playing` — rather than
-  // pausing imperatively in the toggle — guarantees the video can never keep
-  // running after audio stops, regardless of which code path paused us.
+  // Keep the on-screen footage element in lockstep with playback. Video jobs use
+  // it as the master clock + audio bed: keep it playing across contiguous
+  // narration beats (reseek only on a real discontinuity), and pause it on silent
+  // inserts. Non-video jobs reseek their per-scene clip to its in-point.
   React.useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
-    if (playing) {
-      v.currentTime = scene?.sourceInS ?? 0;
-      void v.play().catch(() => {});
-    } else {
+    if (!playing) {
       v.pause();
+      return;
     }
-  }, [playing, idx, scene?.sourceInS]);
+    if (preferFootageAudio) {
+      if (scene?.skipNarration) {
+        v.pause();
+        return;
+      }
+      const target = scene?.sourceInS ?? scene?.startS ?? 0;
+      if (Math.abs(v.currentTime - target) > 0.4) {
+        v.currentTime = target;
+      }
+      void v.play().catch(() => {});
+      return;
+    }
+    v.currentTime = scene?.sourceInS ?? 0;
+    void v.play().catch(() => {});
+  }, [playing, idx, scene?.sourceInS, scene?.startS, scene?.skipNarration, preferFootageAudio]);
+
+  // Drive the muted overlay clip (animated card / b-roll over a video job). It
+  // restarts each beat and follows play/pause; audio stays on the footage bed.
+  React.useEffect(() => {
+    const o = overlayRef.current;
+    if (!o) return;
+    if (playing) {
+      try {
+        o.currentTime = 0;
+      } catch {
+        // not seekable yet
+      }
+      void o.play().catch(() => {});
+    } else {
+      o.pause();
+    }
+  }, [playing, idx]);
 
   const sceneProgress =
     scene && playing
@@ -540,6 +666,7 @@ export function PreviewPlayer({
         stopAllSources();
       }
       videoRef.current?.pause();
+      overlayRef.current?.pause();
       setPlaying(false);
       return;
     }
@@ -564,20 +691,65 @@ export function PreviewPlayer({
 
         <div className={cn("relative w-full overflow-hidden rounded-2xl bg-black [container-type:inline-size]", ASPECT_STAGE[job.aspect])}>
           {/* Stage */}
-          {scene?.kind === "video" ? (
+          {preferFootageAudio ? (
+            <>
+              {/* Footage audio + picture bed: always mounted so the original
+                  video's audio keeps playing — even on beats whose picture is a
+                  b-roll clip or text card (rendered as overlays below). Hidden
+                  (opacity 0) when an overlay is on screen; still audible. */}
+              <video
+                ref={videoRef}
+                src={footageBedSrc ?? undefined}
+                muted={!sceneHasAudio}
+                playsInline
+                preload="auto"
+                className={cn(
+                  "absolute inset-0 size-full object-cover",
+                  sceneIsFootage ? "opacity-100" : "opacity-0",
+                )}
+                onLoadedMetadata={(e) => {
+                  e.currentTarget.muted = !sceneHasAudio;
+                  e.currentTarget.currentTime = scene?.sourceInS ?? scene?.startS ?? 0;
+                }}
+              />
+              {!sceneIsFootage && scene?.kind === "video" && (
+                <video
+                  ref={overlayRef}
+                  key={scene.src}
+                  src={scene.src}
+                  poster={scene.poster}
+                  muted
+                  loop={Boolean(scene.loopClip)}
+                  playsInline
+                  preload="auto"
+                  className="absolute inset-0 size-full object-cover"
+                />
+              )}
+              {!sceneIsFootage && scene?.kind === "photo" && (
+                <img src={scene.poster} alt="" className="absolute inset-0 size-full object-cover" />
+              )}
+              {!sceneIsFootage && scene?.kind === "text" && (
+                <div className="absolute inset-0 grid size-full place-items-center bg-gradient-to-br from-panel-raised to-canvas p-6 text-center">
+                  <span className="line-clamp-6 max-w-[80%] font-heading text-lg font-semibold text-cream">
+                    {scene?.caption}
+                  </span>
+                </div>
+              )}
+            </>
+          ) : scene?.kind === "video" ? (
             <video
               ref={videoRef}
-              key={`v-${idx}`}
-              src={scene.src}
+              key={videoSrc}
+              src={videoSrc}
               poster={scene.poster}
-              muted={!scene.hasOwnAudio}
-              loop={scene.sourceInS === undefined}
+              muted={!sceneHasAudio}
+              loop={Boolean(scene.loopClip)}
               playsInline
-              preload="metadata"
+              preload="auto"
               className="size-full object-cover"
               onLoadedMetadata={(e) => {
                 // React's `muted` attribute is unreliable; enforce on the element.
-                e.currentTarget.muted = !scene.hasOwnAudio;
+                e.currentTarget.muted = !sceneHasAudio;
                 e.currentTarget.currentTime = scene.sourceInS ?? 0;
               }}
             />
@@ -678,10 +850,10 @@ export function PreviewPlayer({
             </span>
             <span>
               {scene?.skipNarration
-                ? scene.hasOwnAudio
+                ? scene.hasOwnAudio && !preferFootageAudio
                   ? "SFX only"
                   : "silent card"
-                : hasNarration
+                : sceneHasAudio || hasNarration
                   ? "with narration"
                 : canUseAudio && !decodeSettled
                   ? "loading audio…"

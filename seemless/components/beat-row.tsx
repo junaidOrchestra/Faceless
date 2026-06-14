@@ -19,7 +19,16 @@ function SourcePill({ source }: { source: string }) {
   );
 }
 
-function Thumb({ beat, searching }: { beat: Beat; searching?: boolean }) {
+function Thumb({
+  beat,
+  searching,
+  footageUrl,
+}: {
+  beat: Beat;
+  searching?: boolean;
+  /** Local object URL of the uploaded video, used for "your footage" beats. */
+  footageUrl?: string | null;
+}) {
   const videoRef = React.useRef<HTMLVideoElement>(null);
   const [active, setActive] = React.useState(false);
 
@@ -59,10 +68,15 @@ function Thumb({ beat, searching }: { beat: Beat; searching?: boolean }) {
   // Keep the list cheap: show the poster image by default and mount a <video>
   // only while the row is hovered/focused. This avoids 40-70 metadata loads for
   // long scripts while preserving hover-preview behavior.
-  const isVideo = asset.kind === "video" && Boolean(asset.mediaUrl);
+  // The whole-video upload plays from the local file (instant, no cloud fetch)
+  // when we have it; everything else (incl. per-beat library uploads) uses the
+  // canonical cloud media_url. sourceInS marks the main footage (see preview).
+  const isMainFootage = asset.source === "yours" && asset.sourceInS !== undefined;
+  const baseMediaUrl = isMainFootage && footageUrl ? footageUrl : asset.mediaUrl;
+  const isVideo = asset.kind === "video" && Boolean(baseMediaUrl);
   const poster = asset.thumbUrl || undefined;
   const sourceInS = asset.sourceInS ?? 0;
-  const videoSrc = poster ? asset.mediaUrl : `${asset.mediaUrl}#t=${Math.max(0.1, sourceInS)}`;
+  const videoSrc = poster ? baseMediaUrl : `${baseMediaUrl}#t=${Math.max(0.1, sourceInS)}`;
 
   const play = () => {
     if (!isVideo) return;
@@ -142,6 +156,7 @@ export const BeatRow = React.memo(function BeatRow({
   searching,
   locked = false,
   strikeFillers = false,
+  footageUrl,
   onOpenPicker,
   onToggleIncluded,
   onPlayBeat,
@@ -153,6 +168,8 @@ export const BeatRow = React.memo(function BeatRow({
   locked?: boolean;
   /** When true, filler words ("um"/"uh"/…) are struck through in the text. */
   strikeFillers?: boolean;
+  /** Local object URL of the uploaded video (for "your footage" thumbnails). */
+  footageUrl?: string | null;
   onOpenPicker: (beatIndex: number) => void;
   onToggleIncluded?: (beatIndex: number) => void;
   /** Preview just this beat (opens the rough-cut player scoped to it). */
@@ -275,7 +292,7 @@ export const BeatRow = React.memo(function BeatRow({
           !beat.included && "saturate-50",
         )}
       >
-        <Thumb beat={beat} searching={searching} />
+        <Thumb beat={beat} searching={searching} footageUrl={footageUrl} />
         {needsChoice && (
           <span className="absolute -right-1 -top-1 size-2.5 rounded-full bg-accent ring-2 ring-canvas" />
         )}

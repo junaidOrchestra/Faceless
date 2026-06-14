@@ -1,6 +1,62 @@
 "use client";
 
+import { loadUploadedMedia } from "./media-cache";
+
 const audioUrls = new Map<string, string>();
+
+// ---------------------------------------------------------------------------
+// Uploaded-footage object URLs (for the local editor preview + beat thumbnails).
+//
+// The editor previews/edits the EXACT uploaded video from the user's machine
+// rather than streaming the cloud copy: instant, works while the background
+// upload is still in flight, and avoids egress. We keep a fresh object URL per
+// job id. An in-session URL (created at upload) is used directly; after a
+// refresh / direct visit it is rehydrated from the IndexedDB cache.
+//
+// IMPORTANT: these blob: URLs are DISPLAY-ONLY and must never be written into a
+// beat's data or sent to the server — the canonical media_url stays the cloud
+// object so the render (and any other device) resolves correctly.
+// ---------------------------------------------------------------------------
+
+const mediaUrls = new Map<string, string>();
+
+/** Remember the uploaded file's object URL for a job (revokes any previous). */
+export function rememberUploadedMedia(jobId: string, file: File): string {
+  const previous = mediaUrls.get(jobId);
+  if (previous) URL.revokeObjectURL(previous);
+  const url = URL.createObjectURL(file);
+  mediaUrls.set(jobId, url);
+  return url;
+}
+
+/** In-session object URL for a job's uploaded footage (sync; undefined if none). */
+export function getUploadedMediaUrl(jobId: string): string | undefined {
+  return mediaUrls.get(jobId);
+}
+
+/**
+ * Resolve a local object URL for a job's uploaded footage, rehydrating from the
+ * IndexedDB cache when there's no in-session URL (e.g. after a refresh). Returns
+ * null when no local copy exists on this device.
+ */
+export async function hydrateUploadedMediaUrl(jobId: string): Promise<string | null> {
+  const existing = mediaUrls.get(jobId);
+  if (existing) return existing;
+  const file = await loadUploadedMedia(jobId);
+  if (!file) return null;
+  // A concurrent hydrate may have won the race while we awaited IndexedDB.
+  const raced = mediaUrls.get(jobId);
+  if (raced) return raced;
+  const url = URL.createObjectURL(file);
+  mediaUrls.set(jobId, url);
+  return url;
+}
+
+export function forgetUploadedMedia(jobId: string): void {
+  const url = mediaUrls.get(jobId);
+  if (url) URL.revokeObjectURL(url);
+  mediaUrls.delete(jobId);
+}
 
 // ---------------------------------------------------------------------------
 // Narration decode cache (for the synced preview player).

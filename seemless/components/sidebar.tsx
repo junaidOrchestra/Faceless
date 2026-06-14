@@ -23,6 +23,7 @@ import { PreviewPlayer } from "@/components/preview-player";
 import { prewarmPreviewAudio } from "@/lib/preview-audio";
 import type { Aspect, VideoJob } from "@/lib/types";
 import { ASPECTS, findChosenAsset, QUALITIES, useEditorStore } from "@/lib/store";
+import { useLocalFootageUrl } from "@/lib/use-local-footage";
 import { cn } from "@/lib/utils";
 
 const ASPECT_BOX: Record<Aspect, string> = {
@@ -38,12 +39,20 @@ function PreviewFrame({ job }: { job: VideoJob }) {
     .map(findChosenAsset)
     .find(Boolean);
   const hasContent = job.beats.some((b) => b.included);
-  const showVideoFrame =
-    firstChosen?.kind === "video" && Boolean(firstChosen.mediaUrl);
+  const localFootageUrl = useLocalFootageUrl(job.id, job.isVideo);
+  // Prefer the local upload for the whole-video footage (sourceInS-tagged); cloud
+  // is the fallback, and per-beat library uploads keep their own URL.
+  const previewMediaUrl =
+    firstChosen?.source === "yours" &&
+    firstChosen?.sourceInS !== undefined &&
+    localFootageUrl
+      ? localFootageUrl
+      : firstChosen?.mediaUrl;
+  const showVideoFrame = firstChosen?.kind === "video" && Boolean(previewMediaUrl);
   const previewSourceInS = firstChosen?.sourceInS ?? 0;
   const previewVideoSrc = firstChosen?.thumbUrl
-    ? firstChosen.mediaUrl
-    : `${firstChosen?.mediaUrl}#t=${Math.max(0.1, previewSourceInS)}`;
+    ? previewMediaUrl
+    : `${previewMediaUrl}#t=${Math.max(0.1, previewSourceInS)}`;
   const [open, setOpen] = React.useState(false);
 
   // Decode the narration ahead of time so pressing play opens with audio

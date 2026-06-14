@@ -420,7 +420,13 @@ export function TimelinePreview({
           if (!isPlaying) footage.pause();
         } else {
           footageSegRef.current = null;
-          if (!isPlaying) footage.pause();
+          // Text cards / inserts occupy real output time but have no matching
+          // range in the uploaded footage. Pause + mute the shared source while
+          // those lanes are active; otherwise the native video/audio track keeps
+          // advancing behind the card and the following beat is already partly
+          // spent when we return to footage.
+          footage.muted = true;
+          footage.pause();
         }
       }
 

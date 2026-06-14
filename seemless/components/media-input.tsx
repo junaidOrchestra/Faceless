@@ -5,7 +5,12 @@ import { useRouter } from "next/navigation";
 import { FileAudio, FileVideo, Loader2, Mic, Video } from "lucide-react";
 import { uploadAudio } from "@/lib/api";
 import { startVideoWithEarlyTranscribe } from "@/lib/background-upload";
-import { rememberPreviewAudio, prewarmPreviewAudio } from "@/lib/preview-audio";
+import {
+  rememberPreviewAudio,
+  rememberUploadedMedia,
+  prewarmPreviewAudio,
+} from "@/lib/preview-audio";
+import { persistUploadedMedia } from "@/lib/media-cache";
 import { FileDrop } from "@/components/file-drop";
 import { Recorder } from "@/components/recorder";
 import { cn } from "@/lib/utils";
@@ -72,6 +77,13 @@ export function MediaInput() {
         // Decode the narration now (the file is already local) so the editor's
         // preview opens instantly instead of waiting on a decode.
         prewarmPreviewAudio(previewUrl);
+        // For a video, serve the editor preview + beat thumbnails from this exact
+        // local file instead of the cloud copy: remember an in-session object URL
+        // and persist the bytes to IndexedDB so it survives a refresh / revisit.
+        if (file.type.startsWith("video/")) {
+          rememberUploadedMedia(videoJobId, file);
+          void persistUploadedMedia(videoJobId, file);
+        }
         try {
           sessionStorage.setItem(`sf:name:${videoJobId}`, file.name);
         } catch {

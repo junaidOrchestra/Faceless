@@ -20,6 +20,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import type { VideoJob } from "@/lib/types";
 import { keptBeats, type JobPhase } from "@/lib/store";
 import { friendlyError } from "@/lib/errors";
+import { useLocalFootageUrl } from "@/lib/use-local-footage";
 
 function GhostRows({ count = 6 }: { count?: number }) {
   return (
@@ -136,6 +137,9 @@ export function Storyboard({
   const beats = job.beats;
   const kept = keptBeats(job);
   const [query, setQuery] = React.useState("");
+  // Local copy of the uploaded video, used to render "your footage" thumbnails
+  // from the user's machine instead of the cloud original.
+  const footageUrl = useLocalFootageUrl(job.id, job.isVideo);
 
   const trimmedQuery = query.trim().toLowerCase();
   const visibleBeats = React.useMemo(() => {
@@ -270,6 +274,7 @@ export function Storyboard({
                       searching={searching}
                       locked={locked}
                       strikeFillers={job.removeFillers}
+                      footageUrl={footageUrl}
                       onOpenPicker={onOpenPicker}
                       onToggleIncluded={onToggleIncluded}
                       onPlayBeat={onPlayBeat}
