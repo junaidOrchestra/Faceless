@@ -34,8 +34,11 @@ from .schemas import (
     BeatCandidateOut,
     BeatClipResponse,
     BeatInsertResponse,
+    BeatMergeResponse,
     BeatOut,
     BeatsResponse,
+    BeatSplitRequest,
+    BeatSplitResponse,
     BeatTextResponse,
     BeatTextUpdate,
     CreateVideoResponse,
@@ -1070,6 +1073,111 @@ async def update_beat_text(
         beat_index=beat_index,
         text=beat.text,
         words=[WordOut(**w) for w in (beat.words or []) if isinstance(w, dict)],
+    )
+
+
+@app.post(
+    "/videos/{video_job_id}/beats/{beat_index}/split",
+    response_model=BeatSplitResponse,
+    tags=["videos"],
+    summary="Split a beat at a word boundary into two beats",
+    description=(
+        "Splits a narration beat into two adjacent beats at ``word_index`` (the "
+        "first word of the second half). Timing for each half is taken from the "
+        "per-word timestamps; the new second half clones the original's clip. "
+        "Beats after the split shift up by one, so re-fetch the beats list."
+    ),
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+    },
+)
+async def split_beat(
+    video_job_id: str,
+    beat_index: int,
+    payload: BeatSplitRequest,
+    session: SessionDep,
+    settings: SettingsDep,
+    user: CurrentUserDep,
+) -> BeatSplitResponse:
+    await enforce_rate_limit(settings, bucket="beat_split", identity=user.id, limit=120)
+    job = await job_service.get_owned_video_job(session, video_job_id, user.id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown video_job_id.")
+    if job.status == "rendering":
+        raise HTTPException(
+            status_code=409, detail="Cannot edit beats while the video is rendering."
+        )
+    indices = await job_service.split_beat(
+        session, video_job_id, beat_index, payload.word_index
+    )
+    if indices is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Beat can't be split there (unknown beat, not a narration beat, "
+            "or invalid word boundary).",
+        )
+    first_index, second_index = indices
+    count = await job_service.count_beats(session, video_job_id)
+    logger.info(
+        "split job %s beat %s at word %s -> %s/%s",
+        video_job_id,
+        beat_index,
+        payload.word_index,
+        first_index,
+        second_index,
+    )
+    return BeatSplitResponse(
+        video_job_id=video_job_id,
+        first_index=first_index,
+        second_index=second_index,
+        beat_count=count,
+    )
+
+
+@app.post(
+    "/videos/{video_job_id}/beats/{beat_index}/merge",
+    response_model=BeatMergeResponse,
+    tags=["videos"],
+    summary="Merge a beat with the next one",
+    description=(
+        "Merges the narration beat at ``beat_index`` with the one immediately "
+        "after it: their text and per-word timing are concatenated and the merged "
+        "beat keeps the first beat's clip. Beats after the pair shift down by one, "
+        "so re-fetch the beats list."
+    ),
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+    },
+)
+async def merge_beat(
+    video_job_id: str,
+    beat_index: int,
+    session: SessionDep,
+    settings: SettingsDep,
+    user: CurrentUserDep,
+) -> BeatMergeResponse:
+    await enforce_rate_limit(settings, bucket="beat_merge", identity=user.id, limit=120)
+    job = await job_service.get_owned_video_job(session, video_job_id, user.id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown video_job_id.")
+    if job.status == "rendering":
+        raise HTTPException(
+            status_code=409, detail="Cannot edit beats while the video is rendering."
+        )
+    merged = await job_service.merge_beats(session, video_job_id, beat_index)
+    if merged is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Beat can't be merged (no next beat, or one side is an insert).",
+        )
+    count = await job_service.count_beats(session, video_job_id)
+    logger.info("merged job %s beats %s+%s", video_job_id, beat_index, beat_index + 1)
+    return BeatMergeResponse(
+        video_job_id=video_job_id, beat_index=merged, beat_count=count
     )
 
 

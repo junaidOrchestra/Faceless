@@ -31,6 +31,8 @@ export default function EditorPage() {
   const toggleBeat = useEditorStore((s) => s.toggleBeat);
   const setAllBeatsIncluded = useEditorStore((s) => s.setAllBeatsIncluded);
   const editBeatText = useEditorStore((s) => s.editBeatText);
+  const splitBeat = useEditorStore((s) => s.splitBeat);
+  const mergeBeatWithNext = useEditorStore((s) => s.mergeBeatWithNext);
 
   const [pickerBeat, setPickerBeat] = React.useState<number | null>(null);
   const [insertPosition, setInsertPosition] = React.useState<number | null>(null);
@@ -66,6 +68,14 @@ export default function EditorPage() {
   const onEditText = React.useCallback(
     (beatIndex: number, text: string) => editBeatText(beatIndex, text),
     [editBeatText],
+  );
+  const onSplitBeat = React.useCallback(
+    (beatIndex: number, wordIndex: number) => splitBeat(beatIndex, wordIndex),
+    [splitBeat],
+  );
+  const onMergeBeat = React.useCallback(
+    (beatIndex: number) => mergeBeatWithNext(beatIndex),
+    [mergeBeatWithNext],
   );
 
   // Edit-while-uploading: gate rendering until the background video upload
@@ -154,6 +164,8 @@ export default function EditorPage() {
             onPlayBeat={playBeat}
             onAddTextBeat={setInsertPosition}
             onEditText={onEditText}
+            onSplitBeat={onSplitBeat}
+            onMergeBeat={onMergeBeat}
           />
         </div>
         {showRender ? (

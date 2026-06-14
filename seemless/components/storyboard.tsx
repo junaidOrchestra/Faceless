@@ -122,6 +122,8 @@ export function Storyboard({
   onPlayBeat,
   onAddTextBeat,
   onEditText,
+  onSplitBeat,
+  onMergeBeat,
 }: {
   job: VideoJob;
   phase: JobPhase;
@@ -133,9 +135,28 @@ export function Storyboard({
   onPlayBeat?: (beatIndex: number) => void;
   onAddTextBeat?: (position: number) => void;
   onEditText?: (beatIndex: number, text: string) => void | Promise<void>;
+  onSplitBeat?: (beatIndex: number, wordIndex: number) => void | Promise<void>;
+  onMergeBeat?: (beatIndex: number) => void | Promise<void>;
 }) {
   const beats = job.beats;
   const kept = keptBeats(job);
+  // A beat can merge with the next one only when both are real narration beats
+  // (inserts have no narration window). Computed off the full list so the
+  // affordance is correct even when the search filter hides neighbours.
+  const beatByIndex = React.useMemo(
+    () => new Map(beats.map((b) => [b.index, b])),
+    [beats],
+  );
+  const canMergeNext = React.useCallback(
+    (index: number) => {
+      const self = beatByIndex.get(index);
+      const next = beatByIndex.get(index + 1);
+      if (!self || !next) return false;
+      return (self.kind ?? "narration") === "narration" &&
+        (next.kind ?? "narration") === "narration";
+    },
+    [beatByIndex],
+  );
   const [query, setQuery] = React.useState("");
   // Local copy of the uploaded video, used to render "your footage" thumbnails
   // from the user's machine instead of the cloud original.
@@ -279,6 +300,9 @@ export function Storyboard({
                       onToggleIncluded={onToggleIncluded}
                       onPlayBeat={onPlayBeat}
                       onEditText={onEditText}
+                      onSplit={onSplitBeat}
+                      onMergeNext={onMergeBeat}
+                      canMergeNext={canMergeNext(beat.index)}
                     />
                     {!locked && !trimmedQuery && !searching && (
                       <AddTextBeatButton position={beat.index + 1} onAdd={onAddTextBeat} />

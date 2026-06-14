@@ -806,6 +806,200 @@ async def insert_animated_beat(
     return position
 
 
+def _beat_text_from_words(words: list[dict[str, Any]], fallback: str) -> str:
+    """Join per-word tokens into beat text, falling back when none are present."""
+
+    joined = " ".join(str(w.get("t", "")).strip() for w in words).strip()
+    return joined or fallback
+
+
+async def _assignment_snapshot(
+    session: AsyncSession, job_id: str, beat_index: int
+) -> dict[str, Any] | None:
+    """Return a plain-dict copy of a beat's clip assignment, or None if it has none.
+
+    Used to duplicate the clip onto a freshly-split second half so both beats
+    show the same footage until the user re-picks one.
+    """
+
+    result = await session.execute(
+        select(BeatAssignment).where(
+            BeatAssignment.video_job_id == job_id,
+            BeatAssignment.beat_index == beat_index,
+        )
+    )
+    a = result.scalar_one_or_none()
+    if a is None:
+        return None
+    return {
+        "platform": a.platform,
+        "media_url": a.media_url,
+        "preview_url": a.preview_url,
+        "kind": a.kind,
+        "score": a.score,
+        "attribution": a.attribution,
+        "candidates": [dict(c) for c in (a.candidates or []) if isinstance(c, dict)],
+    }
+
+
+async def split_beat(
+    session: AsyncSession, job_id: str, beat_index: int, word_index: int
+) -> tuple[int, int] | None:
+    """Split a narration beat at a word boundary into two adjacent beats.
+
+    The beat at ``beat_index`` keeps ``words[:word_index]`` (its end time becomes
+    the last kept word's end); a new beat is inserted at ``beat_index + 1`` with
+    ``words[word_index:]`` (its start time is the first moved word's start). All
+    beats/assignments after the original shift up by one. The new beat duplicates
+    the original's clip assignment so both halves keep showing the same footage
+    until the user re-picks. Returns ``(first_index, second_index)`` or ``None``
+    when the beat is missing, not a narration beat, or the split point is invalid.
+    Callers should re-fetch the beats afterwards (indices have shifted).
+    """
+
+    result = await session.execute(
+        select(Beat).where(Beat.video_job_id == job_id, Beat.index == beat_index)
+    )
+    beat = result.scalar_one_or_none()
+    if beat is None or (beat.kind or "narration") != "narration":
+        return None
+    words = [w for w in (beat.words or []) if isinstance(w, dict)]
+    # Need real per-word timing on both sides to keep the halves in sync.
+    if len(words) < 2 or not (1 <= word_index < len(words)):
+        return None
+
+    first_words = words[:word_index]
+    second_words = words[word_index:]
+    orig_end = float(beat.end_s)
+    first_end = float(first_words[-1].get("e", orig_end))
+    second_start = float(second_words[0].get("s", first_end))
+    first_text = _beat_text_from_words(first_words, beat.text)
+    second_text = _beat_text_from_words(second_words, beat.text)
+
+    # Capture the clip BEFORE the shift (its index doesn't move) so we can clone
+    # it onto the new second half.
+    assignment = await _assignment_snapshot(session, job_id, beat_index)
+
+    # Vacate slot beat_index+1: move everything after the original up by one via a
+    # disjoint offset range so neither UPDATE hits a transient PK collision.
+    for table, idx_col in (
+        (Beat, Beat.index),
+        (BeatAssignment, BeatAssignment.beat_index),
+    ):
+        job_col = table.video_job_id
+        await session.execute(
+            update(table)
+            .where(job_col == job_id, idx_col > beat_index)
+            .values({idx_col.key: idx_col + _SHIFT_OFFSET})
+        )
+        await session.execute(
+            update(table)
+            .where(job_col == job_id, idx_col >= _SHIFT_OFFSET)
+            .values({idx_col.key: idx_col - _SHIFT_OFFSET + 1})
+        )
+
+    # Shrink the original beat to the first half.
+    beat.text = first_text
+    beat.words = first_words
+    beat.end_s = first_end
+
+    session.add(
+        Beat(
+            video_job_id=job_id,
+            index=beat_index + 1,
+            text=second_text,
+            start_s=second_start,
+            end_s=orig_end,
+            queries=beat.queries,
+            words=second_words,
+            kind="narration",
+            duration_s=None,
+        )
+    )
+    if assignment is not None:
+        session.add(
+            BeatAssignment(
+                video_job_id=job_id,
+                beat_index=beat_index + 1,
+                platform=assignment["platform"],
+                media_url=assignment["media_url"],
+                preview_url=assignment["preview_url"],
+                kind=assignment["kind"],
+                score=assignment["score"],
+                attribution=assignment["attribution"],
+                candidates=assignment["candidates"] or None,
+            )
+        )
+    await session.commit()
+    return beat_index, beat_index + 1
+
+
+async def merge_beats(
+    session: AsyncSession, job_id: str, beat_index: int
+) -> int | None:
+    """Merge the narration beat at ``beat_index`` with the one immediately after it.
+
+    The two beats' text and per-word timing are concatenated; the surviving beat
+    spans ``[first.start_s, second.end_s]`` and keeps the first beat's clip. The
+    second beat (and its assignment) are deleted and every later beat/assignment
+    shifts down by one. Returns the merged beat index, or ``None`` when there is
+    no next beat or either side is a non-narration insert. Callers should
+    re-fetch the beats afterwards (indices have shifted).
+    """
+
+    result = await session.execute(
+        select(Beat)
+        .where(
+            Beat.video_job_id == job_id,
+            Beat.index.in_([beat_index, beat_index + 1]),
+        )
+        .order_by(Beat.index)
+    )
+    beats = list(result.scalars())
+    if len(beats) != 2:
+        return None
+    first, second = beats
+    if (first.kind or "narration") != "narration" or (
+        second.kind or "narration"
+    ) != "narration":
+        return None
+
+    first_words = [w for w in (first.words or []) if isinstance(w, dict)]
+    second_words = [w for w in (second.words or []) if isinstance(w, dict)]
+    first.text = f"{first.text} {second.text}".strip()
+    first.words = (first_words + second_words) or None
+    first.end_s = float(second.end_s)
+
+    # Drop the absorbed beat and its clip, then close the gap by shifting every
+    # later row down by one (via the disjoint offset range to avoid PK clashes).
+    await session.execute(
+        delete(Beat).where(Beat.video_job_id == job_id, Beat.index == beat_index + 1)
+    )
+    await session.execute(
+        delete(BeatAssignment).where(
+            BeatAssignment.video_job_id == job_id,
+            BeatAssignment.beat_index == beat_index + 1,
+        )
+    )
+    for table, idx_col in (
+        (Beat, Beat.index),
+        (BeatAssignment, BeatAssignment.beat_index),
+    ):
+        job_col = table.video_job_id
+        await session.execute(
+            update(table)
+            .where(job_col == job_id, idx_col > beat_index + 1)
+            .values({idx_col.key: idx_col + _SHIFT_OFFSET})
+        )
+        await session.execute(
+            update(table)
+            .where(job_col == job_id, idx_col >= _SHIFT_OFFSET)
+            .values({idx_col.key: idx_col - _SHIFT_OFFSET - 1})
+        )
+    await session.commit()
+    return beat_index
+
+
 async def get_beats_with_assignments(
     session: AsyncSession, job_id: str
 ) -> list[tuple[Beat, BeatAssignment | None]]:

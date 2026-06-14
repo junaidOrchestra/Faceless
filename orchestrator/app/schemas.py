@@ -368,6 +368,48 @@ class BeatTextResponse(BaseModel):
     words: list[WordOut] = Field(default_factory=list)
 
 
+class BeatSplitRequest(BaseModel):
+    """Where to split a beat: the index of the first word of the SECOND half.
+
+    ``word_index`` is 1-based-exclusive over the beat's per-word list, i.e. it must
+    be ``1 <= word_index < len(words)`` so both halves keep at least one word.
+    """
+
+    word_index: int = Field(
+        ...,
+        ge=1,
+        description="First word index of the second half (1..len(words)-1).",
+        examples=[3],
+    )
+
+
+class BeatSplitResponse(BaseModel):
+    """Result of splitting a beat at a word boundary into two beats.
+
+    The original beat keeps the words before the cut (``first_index``); a new beat
+    holds the rest (``second_index``). Every later beat shifted up by one, so the
+    client should re-fetch the beats list.
+    """
+
+    video_job_id: str
+    first_index: int
+    second_index: int
+    beat_count: int
+
+
+class BeatMergeResponse(BaseModel):
+    """Result of merging a beat with the one after it.
+
+    The two beats become one (``beat_index``) spanning both narration windows;
+    every later beat shifted down by one, so the client should re-fetch the beats
+    list.
+    """
+
+    video_job_id: str
+    beat_index: int
+    beat_count: int
+
+
 class TierInfo(BaseModel):
     """Per-tier limits surfaced to the client (mirrors app.tiers.TierConfig)."""
 

@@ -445,28 +445,19 @@ export function PreviewPlayer({
         curSeg &&
         !curSeg.scene.skipNarration
       ) {
-        const mediaTime = el.currentTime;
-        const mediaSegIndex = segs.findIndex(({ scene, dur }) => {
-          if (scene.skipNarration) return false;
-          const mediaStart = scene.sourceInS ?? scene.startS;
-          return mediaTime >= mediaStart - 0.03 && mediaTime < mediaStart + dur - 0.03;
-        });
-        const mediaSeg = mediaSegIndex >= 0 ? segs[mediaSegIndex] : curSeg;
-        const mediaStart = mediaSeg.scene.sourceInS ?? mediaSeg.scene.startS;
-        const mediaEnd = mediaStart + mediaSeg.dur;
-        if (mediaSegIndex >= 0) {
-          a.virtual = mediaSeg.offset + (mediaTime - mediaStart);
-        } else if (mediaTime >= mediaEnd - 0.02 && curIdx + 1 < segs.length) {
-          const nextSeg = segs[curIdx + 1];
-          if (!nextSeg.scene.skipNarration) {
-            const nextMediaStart = nextSeg.scene.sourceInS ?? nextSeg.scene.startS;
-            if (Math.abs(mediaTime - nextMediaStart) > 0.05) {
-              el.currentTime = nextMediaStart;
-            }
-            a.virtual = nextSeg.offset;
-          }
+        // Map the footage clock onto ONLY the current beat's window. Inserts add
+        // virtual time but NO footage time (the upload plays contiguously across
+        // them), so a global search would match the post-insert narration beat
+        // and skip the card. We anchor while the footage is inside this beat;
+        // once it passes the beat's end we STOP re-anchoring and let the perf
+        // clock carry the timeline into whatever comes next — an insert card
+        // (footage pauses) or the next narration beat (footage seeks/continues).
+        const mediaStart = curSeg.scene.sourceInS ?? curSeg.scene.startS;
+        const within = el.currentTime - mediaStart;
+        if (within < curSeg.dur) {
+          a.virtual = curSeg.offset + Math.max(0, within);
+          if (a.mode === "silent") a.perf = performance.now();
         }
-        if (a.mode === "silent") a.perf = performance.now();
       }
       const v =
         a.mode === "audio" && audioCtxRef.current

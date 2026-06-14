@@ -4,8 +4,10 @@ import type { RelWord } from "./animated-text";
 import {
   getVideoJob,
   insertAnimatedBeat as insertAnimatedBeatApi,
+  mergeBeats as mergeBeatsApi,
   prepareJob,
   searchAllClips,
+  splitBeat as splitBeatApi,
   startRender,
   updateBeatText as updateBeatTextApi,
   uploadAnimatedClip as uploadAnimatedClipApi,
@@ -43,6 +45,10 @@ type EditorState = {
     words: RelWord[],
   ) => Promise<void>;
   setOverlay: (beatIndex: number, overlay: string) => void;
+  /** Split a narration beat in two at a word boundary (server-persisted). */
+  splitBeat: (beatIndex: number, wordIndex: number) => Promise<void>;
+  /** Merge a narration beat with the one after it (server-persisted). */
+  mergeBeatWithNext: (beatIndex: number) => Promise<void>;
   editBeatText: (beatIndex: number, text: string) => Promise<void>;
   /** Re-record the beat's animated text card with its current text/config. */
   rerecordAnimatedCard: (beatIndex: number) => Promise<void>;
@@ -88,6 +94,69 @@ function releaseJobBlobs(job: VideoJob | null): void {
 
 function mutateBeat(job: VideoJob, index: number, fn: (b: Beat) => Beat): VideoJob {
   return { ...job, beats: job.beats.map((b) => (b.index === index ? fn(b) : b)) };
+}
+
+const beatKind = (b: Beat): string => b.kind ?? "narration";
+const wordsText = (ws: Beat["words"], fallback: string): string =>
+  (ws ?? []).map((w) => w.text.trim()).join(" ").trim() || fallback;
+
+/**
+ * Optimistic split of a narration beat at ``wordIndex`` (first word of the second
+ * half). Returns the reindexed beats, or null when the split isn't valid. Both
+ * halves keep the original beat's clip until the server reconciles.
+ */
+function optimisticSplit(beats: Beat[], index: number, wordIndex: number): Beat[] | null {
+  const beat = beats.find((b) => b.index === index);
+  if (!beat || beatKind(beat) !== "narration") return null;
+  const words = beat.words ?? [];
+  if (words.length < 2 || wordIndex < 1 || wordIndex >= words.length) return null;
+
+  const firstWords = words.slice(0, wordIndex);
+  const secondWords = words.slice(wordIndex);
+  const firstEnd = firstWords[firstWords.length - 1]?.to ?? beat.to;
+  const secondStart = secondWords[0]?.from ?? firstEnd;
+
+  const first: Beat = {
+    ...beat,
+    text: wordsText(firstWords, beat.text),
+    words: firstWords,
+    to: firstEnd,
+  };
+  const second: Beat = {
+    ...beat,
+    index: index + 1,
+    text: wordsText(secondWords, beat.text),
+    words: secondWords,
+    from: secondStart,
+    to: beat.to,
+  };
+  const shifted = beats.map((b) => (b.index > index ? { ...b, index: b.index + 1 } : b));
+  return [...shifted.filter((b) => b.index !== index), first, second].sort(
+    (a, b) => a.index - b.index,
+  );
+}
+
+/**
+ * Optimistic merge of the narration beat at ``index`` with the one after it.
+ * Returns the reindexed beats (the merged beat keeps the first beat's clip), or
+ * null when either side is missing / a non-narration insert.
+ */
+function optimisticMerge(beats: Beat[], index: number): Beat[] | null {
+  const first = beats.find((b) => b.index === index);
+  const second = beats.find((b) => b.index === index + 1);
+  if (!first || !second) return null;
+  if (beatKind(first) !== "narration" || beatKind(second) !== "narration") return null;
+
+  const merged: Beat = {
+    ...first,
+    text: `${first.text} ${second.text}`.trim(),
+    words: [...(first.words ?? []), ...(second.words ?? [])],
+    to: second.to,
+  };
+  return beats
+    .filter((b) => b.index !== index + 1)
+    .map((b) => (b.index === index ? merged : b.index > index + 1 ? { ...b, index: b.index - 1 } : b))
+    .sort((a, b) => a.index - b.index);
 }
 
 /**
@@ -506,6 +575,58 @@ export const useEditorStore = create<EditorState>((set, get) => {
       const { job } = get();
       if (!job) return;
       set({ job: mutateBeat(job, beatIndex, (b) => ({ ...b, overlay })) });
+    },
+
+    splitBeat: async (beatIndex, wordIndex) => {
+      const { job } = get();
+      if (!job) return;
+      const next = optimisticSplit(job.beats, beatIndex, wordIndex);
+      if (!next) return;
+      // Optimistic: show the two halves immediately, then reconcile with the
+      // authoritative beats/assignments from the server (indices have shifted).
+      set({ job: { ...job, beats: next } });
+      try {
+        await splitBeatApi(job.id, beatIndex, wordIndex);
+        const incoming = await getVideoJob(job.id);
+        const current = get().job ?? job;
+        set({ job: preserveLocalJobState(current, incoming) });
+      } catch (e) {
+        const current = get().job;
+        if (current?.id === job.id) {
+          set({
+            job: {
+              ...job,
+              error: e instanceof Error ? e.message : "Could not split the beat.",
+            },
+          });
+        }
+        throw e;
+      }
+    },
+
+    mergeBeatWithNext: async (beatIndex) => {
+      const { job } = get();
+      if (!job) return;
+      const next = optimisticMerge(job.beats, beatIndex);
+      if (!next) return;
+      set({ job: { ...job, beats: next } });
+      try {
+        await mergeBeatsApi(job.id, beatIndex);
+        const incoming = await getVideoJob(job.id);
+        const current = get().job ?? job;
+        set({ job: preserveLocalJobState(current, incoming) });
+      } catch (e) {
+        const current = get().job;
+        if (current?.id === job.id) {
+          set({
+            job: {
+              ...job,
+              error: e instanceof Error ? e.message : "Could not merge the beats.",
+            },
+          });
+        }
+        throw e;
+      }
     },
 
     editBeatText: async (beatIndex, text) => {

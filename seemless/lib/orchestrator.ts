@@ -595,6 +595,43 @@ export async function orchInsertAnimatedBeat(
 }
 
 /**
+ * Split a narration beat at a word boundary into two beats. ``wordIndex`` is the
+ * first word of the second half (1..len(words)-1). Beats after the split shift
+ * up by one, so callers should re-fetch the job afterwards.
+ */
+export async function orchSplitBeat(
+  id: string,
+  beatIndex: number,
+  wordIndex: number,
+): Promise<{ firstIndex: number; secondIndex: number }> {
+  const data = await jsonOrThrow(
+    await fetch(`/api/videos/${id}/beats/${beatIndex}/split`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ word_index: wordIndex }),
+    }),
+  );
+  return {
+    firstIndex: Number(data.first_index ?? beatIndex),
+    secondIndex: Number(data.second_index ?? beatIndex + 1),
+  };
+}
+
+/**
+ * Merge a narration beat with the one immediately after it. Beats after the pair
+ * shift down by one, so callers should re-fetch the job afterwards.
+ */
+export async function orchMergeBeats(
+  id: string,
+  beatIndex: number,
+): Promise<{ beatIndex: number }> {
+  const data = await jsonOrThrow(
+    await fetch(`/api/videos/${id}/beats/${beatIndex}/merge`, { method: "POST" }),
+  );
+  return { beatIndex: Number(data.beat_index ?? beatIndex) };
+}
+
+/**
  * Upload a browser-recorded animated text-card clip for one beat. The backend
  * stores it and registers it as a selected candidate; we return the candidate
  * index so the render override can re-select it, plus the stored media URL.

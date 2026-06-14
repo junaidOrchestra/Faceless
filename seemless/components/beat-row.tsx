@@ -1,7 +1,19 @@
 "use client";
 
 import * as React from "react";
-import { Check, Loader2, Pencil, Play, Plus, Replace, Type, Video, X } from "lucide-react";
+import {
+  Check,
+  Combine,
+  Loader2,
+  Pencil,
+  Play,
+  Plus,
+  Replace,
+  Scissors,
+  Type,
+  Video,
+  X,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
@@ -161,6 +173,9 @@ export const BeatRow = React.memo(function BeatRow({
   onToggleIncluded,
   onPlayBeat,
   onEditText,
+  onSplit,
+  onMergeNext,
+  canMergeNext = false,
 }: {
   beat: Beat;
   index: number;
@@ -177,9 +192,18 @@ export const BeatRow = React.memo(function BeatRow({
   /** Correct a mis-transcribed word. Returns a promise while it persists (and,
    *  for animated cards, re-records the clip with the corrected text). */
   onEditText?: (beatIndex: number, text: string) => void | Promise<void>;
+  /** Split this beat into two at a word boundary (wordIndex = first word of the
+   *  second half). */
+  onSplit?: (beatIndex: number, wordIndex: number) => void | Promise<void>;
+  /** Merge this beat with the next one. */
+  onMergeNext?: (beatIndex: number) => void | Promise<void>;
+  /** Whether a mergeable narration beat follows this one. */
+  canMergeNext?: boolean;
 }) {
   const [editing, setEditing] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
+  const [splitting, setSplitting] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
   const [draft, setDraft] = React.useState(beat.text);
 
   // Render word-by-word only when we're striking fillers and there is at least
@@ -191,6 +215,38 @@ export const BeatRow = React.memo(function BeatRow({
   const chosenAsset = findChosenAsset(beat);
   const isAnimated = chosenAsset?.source === "animated";
   const canEditText = Boolean(onEditText) && !locked && !beat.loading;
+
+  // Split/merge only apply to real narration beats (inserts have no narration
+  // window to redistribute). A split needs at least two timed words to land a
+  // boundary between.
+  const isNarration = (beat.kind ?? "narration") === "narration";
+  const splitWords = beat.words ?? [];
+  const canSplit =
+    Boolean(onSplit) &&
+    !locked &&
+    !beat.loading &&
+    isNarration &&
+    splitWords.length >= 2;
+  const canMerge =
+    Boolean(onMergeNext) && !locked && !beat.loading && isNarration && canMergeNext;
+
+  const doSplit = async (wordIndex: number) => {
+    setSplitting(false);
+    setBusy(true);
+    try {
+      await onSplit?.(index, wordIndex);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const doMerge = async () => {
+    setBusy(true);
+    try {
+      await onMergeNext?.(index);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const startEdit = () => {
     setDraft(beat.text);
@@ -318,7 +374,45 @@ export const BeatRow = React.memo(function BeatRow({
             </span>
           )}
         </div>
-        {editing ? (
+        {splitting ? (
+          <div
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => e.stopPropagation()}
+          >
+            <p className="mb-1.5 text-[11px] font-medium text-accent">
+              Tap between two words to split this beat there
+            </p>
+            <p className="text-sm leading-relaxed text-cream/90">
+              {splitWords.map((w, i) => (
+                <React.Fragment key={i}>
+                  {i > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => void doSplit(i)}
+                      className="group/split relative mx-px inline-flex h-5 w-2.5 cursor-pointer items-center justify-center align-middle focus-visible:outline-none"
+                      aria-label={`Split before “${w.text.trim()}”`}
+                      title="Split here"
+                    >
+                      <span className="h-4 w-0.5 rounded-full bg-hairline transition-all group-hover/split:h-5 group-hover/split:w-1 group-hover/split:bg-accent group-focus-visible/split:bg-accent" />
+                    </button>
+                  )}
+                  <span>{w.text.trim()}</span>
+                </React.Fragment>
+              ))}
+            </p>
+            <div className="mt-1.5">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setSplitting(false)}
+                disabled={busy}
+              >
+                <X className="size-3.5" />
+                Cancel
+              </Button>
+            </div>
+          </div>
+        ) : editing ? (
           <div
             onClick={(e) => e.stopPropagation()}
             onKeyDown={(e) => e.stopPropagation()}
@@ -428,20 +522,61 @@ export const BeatRow = React.memo(function BeatRow({
 
       {!locked &&
         (beat.included ? (
-          <Button
-            size="icon-sm"
-            variant="ghost"
-            className="shrink-0 opacity-60 transition-opacity group-hover:opacity-100"
-            onClick={(e) => {
-              e.stopPropagation();
-              onOpenPicker(index);
-            }}
-            disabled={beat.loading}
-            aria-label="Change clip"
-            title="Change clip"
-          >
-            <Replace className="size-4" />
-          </Button>
+          <div className="flex shrink-0 items-center gap-0.5">
+            {canSplit && (
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                className={cn(
+                  "shrink-0 opacity-60 transition-opacity group-hover:opacity-100",
+                  splitting && "bg-panel-raised text-accent opacity-100",
+                )}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setSplitting((s) => !s);
+                }}
+                disabled={busy}
+                aria-label="Split beat"
+                title="Split this beat in two"
+              >
+                <Scissors className="size-4" />
+              </Button>
+            )}
+            {canMerge && (
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                className="shrink-0 opacity-60 transition-opacity group-hover:opacity-100"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void doMerge();
+                }}
+                disabled={busy}
+                aria-label="Merge with next beat"
+                title="Merge with the next beat"
+              >
+                {busy ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Combine className="size-4" />
+                )}
+              </Button>
+            )}
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              className="shrink-0 opacity-60 transition-opacity group-hover:opacity-100"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenPicker(index);
+              }}
+              disabled={beat.loading}
+              aria-label="Change clip"
+              title="Change clip"
+            >
+              <Replace className="size-4" />
+            </Button>
+          </div>
         ) : onToggleIncluded ? (
           <Button
             size="sm"

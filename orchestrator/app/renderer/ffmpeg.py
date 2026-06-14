@@ -96,6 +96,14 @@ class FFmpegRenderer(Renderer):
         self._crf = crf
         self._subprocess_timeout_s = subprocess_timeout_s
         self._cpu_permits = threading.BoundedSemaphore(os.cpu_count() or 2)
+        # Serialises the multi-permit acquisition below. Each encode needs
+        # ``enc_threads`` permits and grabs them one-by-one; with the shared
+        # semaphore spanning concurrent render jobs, letting two encodes
+        # interleave partial acquisitions can deadlock (everyone holds 1 permit
+        # and waits forever for a 2nd). Acquiring under this lock makes each
+        # encode take all-or-nothing, so the cycle can't form. Releases stay
+        # lock-free, so permit holders always drain and the waiter proceeds.
+        self._permit_lock = threading.Lock()
 
     def _ffmpeg(self, args: list[str]) -> None:
         """Run ffmpeg with this renderer's configured hard subprocess timeout."""
@@ -270,9 +278,12 @@ class FFmpegRenderer(Renderer):
                 # Shared across concurrent render jobs in this process. A single
                 # render can use all cores, but parallel renders share permits
                 # instead of each scheduling a full cpu_count worth of x264 work.
-                for _ in range(enc_threads):
-                    self._cpu_permits.acquire()
-                    acquired += 1
+                # Grab all needed permits under the lock so two encodes can't each
+                # hold a subset and deadlock waiting for the rest.
+                with self._permit_lock:
+                    for _ in range(enc_threads):
+                        self._cpu_permits.acquire()
+                        acquired += 1
                 return self._encode_beat(
                     idx, beat, path, work, width, height, threads=enc_threads
                 )

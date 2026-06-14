@@ -14,9 +14,11 @@ import { resyncWords, sleep } from "./utils";
 import {
   orchGetVideoJob,
   orchInsertAnimatedBeat,
+  orchMergeBeats,
   orchPrepare,
   orchSearchAllClips,
   orchSearchClips,
+  orchSplitBeat,
   orchStartRender,
   orchUpdateBeatText,
   orchUploadAnimatedClip,
@@ -350,6 +352,38 @@ export async function updateBeatText(
     };
   }
   return { text: clean, words };
+}
+
+/**
+ * Split a narration beat into two at ``wordIndex`` (the first word of the second
+ * half). Beats after the split shift up by one; callers re-fetch the job. The
+ * mock/offline path has no split endpoint, so it's a no-op there.
+ */
+export async function splitBeat(
+  jobId: string,
+  beatIndex: number,
+  wordIndex: number,
+): Promise<{ firstIndex: number; secondIndex: number }> {
+  if (USE_ORCHESTRATOR) {
+    return orchSplitBeat(jobId, beatIndex, wordIndex);
+  }
+  await sleep(150);
+  return { firstIndex: beatIndex, secondIndex: beatIndex + 1 };
+}
+
+/**
+ * Merge a narration beat with the one after it. Beats after the pair shift down
+ * by one; callers re-fetch the job. No-op on the mock/offline path.
+ */
+export async function mergeBeats(
+  jobId: string,
+  beatIndex: number,
+): Promise<{ beatIndex: number }> {
+  if (USE_ORCHESTRATOR) {
+    return orchMergeBeats(jobId, beatIndex);
+  }
+  await sleep(150);
+  return { beatIndex };
 }
 
 export type RenderSettings = {
