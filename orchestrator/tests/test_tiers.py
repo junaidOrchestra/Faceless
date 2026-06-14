@@ -15,11 +15,11 @@ from ._auth import auth_header, make_token
 
 
 def test_check_video_length_unit() -> None:
-    # Free tier caps at 60s; a 2-minute video violates it, a short one does not.
-    assert tiers.check_video_length("free", 120) is not None
+    # Public tiers cap at 1 hour; longer videos violate it, shorter ones do not.
+    assert tiers.check_video_length("free", 3601) is not None
     assert tiers.check_video_length("free", 30) is None
-    # Higher tiers allow longer videos.
-    assert tiers.check_video_length("professional", 120) is None
+    # Higher tiers share the same one-hour cap.
+    assert tiers.check_video_length("professional", 3600) is None
     # Admin has no length limit (max_video_seconds == 0).
     assert tiers.check_video_length("admin", 99999) is None
 
@@ -86,7 +86,7 @@ async def test_over_limit_render_rejected(client: AsyncClient, tmp_path, monkeyp
     else:
         pytest.fail("job never reached ready")
 
-    # Force the measured duration well past the free tier's 60s cap.
+    # Force the measured duration well past the free tier's 1-hour cap.
     async def _fake_duration(_session, _job_id: str) -> float:
         return 9999.0
 

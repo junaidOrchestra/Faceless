@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -242,7 +242,16 @@ class Settings(BaseSettings):
         description="Fail an awaiting_clip job whose clip search never finishes in this long.",
     )
 
-    max_upload_bytes: int = 50 * 1024 * 1024
+    max_upload_bytes: int = 3 * 1024 * 1024 * 1024
+    max_upload_duration_s: float = 3600.0
+    upload_part_size_bytes: int = Field(
+        default=32 * 1024 * 1024,
+        description=(
+            "Target part size (bytes) for direct browser->bucket multipart "
+            "uploads. S3/R2 require parts >= 5MB (except the last); smaller "
+            "values are clamped up. Larger parts mean fewer presigned URLs."
+        ),
+    )
     render_temp_dir: str = "/tmp/faceless-render"
 
     # --- Uploaded media validation -------------------------------------------
@@ -303,45 +312,72 @@ class Settings(BaseSettings):
         description="Prefix used for the local result_url when storage_local is true.",
     )
 
-    # --- Result storage backend ----------------------------------------------
+    # --- Result storage backend (S3-compatible API) --------------------------
+    # When storage_local is false the rendered mp4, narration audio, and per-beat
+    # clips live in an S3-compatible bucket reached over the S3 API. This works
+    # for Backblaze B2's S3-compatible API, Cloudflare R2, MinIO, etc. — only the
+    # endpoint/region differ. The canonical env names are the ``B2_*`` ones below;
+    # ``S3_*``/``R2_*`` are also accepted as aliases.
     storage_local: bool = Field(
         default=True,
         description=(
             "When true (default), keep the rendered mp4 on local disk and return "
             "a local result_url built from result_base_url. When false, upload "
-            "the mp4 to Backblaze B2 and return its download URL (requires the "
-            "b2_* settings below)."
+            "media to the S3-compatible bucket and return a download URL (requires "
+            "the storage settings below)."
         ),
     )
-    b2_key_id: str | None = Field(
-        default=None, description="Backblaze B2 application key id (keyID)."
+    s3_endpoint_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "B2_S3_ENDPOINT", "S3_ENDPOINT_URL", "R2_ENDPOINT_URL"
+        ),
+        description=(
+            "S3-compatible endpoint URL. Backblaze B2: "
+            "https://s3.<region>.backblazeb2.com (e.g. s3.us-west-004.backblazeb2.com)."
+        ),
     )
-    b2_application_key: str | None = Field(
-        default=None, description="Backblaze B2 application key (secret)."
+    s3_region: str = Field(
+        default="auto",
+        validation_alias=AliasChoices("B2_S3_REGION", "S3_REGION", "R2_REGION"),
+        description=(
+            "Bucket region. Backblaze B2 uses its zone (e.g. 'us-west-004'); "
+            "Cloudflare R2 uses 'auto'."
+        ),
     )
-    b2_bucket_name: str | None = Field(
-        default=None, description="Backblaze B2 bucket to upload results into."
+    s3_access_key_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "B2_KEY_ID", "S3_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"
+        ),
+        description="S3 access key id (Backblaze B2 keyID).",
     )
-    b2_prefix: str = Field(
+    s3_secret_access_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "B2_APPLICATION_KEY", "S3_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"
+        ),
+        description="S3 secret access key (Backblaze B2 applicationKey).",
+    )
+    s3_bucket: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("B2_BUCKET_NAME", "S3_BUCKET", "R2_BUCKET"),
+        description="Bucket to upload results into.",
+    )
+    s3_prefix: str = Field(
         default="",
+        validation_alias=AliasChoices("B2_PREFIX", "S3_PREFIX", "R2_PREFIX"),
         description="Optional key prefix (folder) inside the bucket, e.g. 'videos'.",
     )
-    b2_timeout_s: float = Field(
-        default=300.0,
-        description=(
-            "Backstop wall-clock for a single B2 operation (upload/download/"
-            "presign). b2sdk retries internally and can stall for minutes on an "
-            "outage; this makes submit/render/download fail predictably instead "
-            "of hanging. (The worker thread may keep running until the SDK gives "
-            "up, but the job no longer blocks on it.)"
-        ),
-    )
-    b2_public_base_url: str | None = Field(
+    s3_public_base_url: str | None = Field(
         default=None,
+        validation_alias=AliasChoices(
+            "B2_PUBLIC_BASE_URL", "S3_PUBLIC_BASE_URL", "R2_PUBLIC_BASE_URL"
+        ),
         description=(
-            "Optional public base URL (custom domain / CDN) for B2 files. If set, "
-            "result_url = <base>/<key>; otherwise the bucket's native download URL "
-            "is used. Only meaningful for public buckets."
+            "Optional public base URL (public bucket URL or custom domain / CDN). "
+            "If set, result_url = <base>/<key>; otherwise a time-limited presigned "
+            "URL is generated. Only set this for publicly readable buckets."
         ),
     )
 

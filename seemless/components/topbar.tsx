@@ -36,6 +36,8 @@ export function TopBar({
   onMakeVideo,
   busy = false,
   hideMakeVideo = false,
+  uploadPending = false,
+  uploadPercent,
 }: {
   fileName: string;
   duration: number;
@@ -46,6 +48,8 @@ export function TopBar({
   onMakeVideo: () => void;
   busy?: boolean;
   hideMakeVideo?: boolean;
+  uploadPending?: boolean;
+  uploadPercent?: number;
 }) {
   const ready = total > 0 && chosen >= total;
   const isDesktop = useIsDesktop();
@@ -85,6 +89,13 @@ export function TopBar({
                   <Clapperboard className="size-4" />
                   Upgrade to render
                 </Link>
+              </Button>
+            ) : uploadPending ? (
+              <Button variant="primary" disabled>
+                <Loader2 className="size-4 animate-spin" />
+                {uploadPercent != null && uploadPercent < 100
+                  ? `Uploading ${uploadPercent}%…`
+                  : "Uploading video…"}
               </Button>
             ) : (
               <Button variant="primary" disabled={!ready || busy} onClick={onMakeVideo}>

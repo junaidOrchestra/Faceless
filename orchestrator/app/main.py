@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 from . import __version__
 from . import media_validation
 from . import queue as job_queue
+from . import s3_storage
 from . import storage
 from . import tiers
 from . import vibes
@@ -43,13 +44,18 @@ from .schemas import (
     ErrorResponse,
     FeedbackRequest,
     FeedbackResponse,
+    FinalizeUploadRequest,
     HealthResponse,
     MeResponse,
     PrepareRequest,
     ProjectOut,
     ProjectsResponse,
     RenderRequest,
+    StartUploadRequest,
     TierInfo,
+    UploadPartUrl,
+    UploadUrlRequest,
+    UploadUrlResponse,
     VideoCredentials,
     VideoStatusResponse,
     WordOut,
@@ -235,6 +241,7 @@ async def _validate_or_reject(path: Path, settings: Settings) -> None:
             path,
             probe_timeout_s=settings.media_probe_timeout_s,
             require_audio=settings.media_require_audio_stream,
+            max_duration_s=settings.max_upload_duration_s,
         )
     except media_validation.MediaValidationError as exc:
         path.unlink(missing_ok=True)
@@ -429,6 +436,9 @@ async def create_video(
         "theme": {"mode": "script", "vibe": None},
         "quality": quality_tier,
         "subtitles": subtitles,
+        # Video uploads show the user's footage on every beat by default; stock
+        # b-roll is only fetched when the editor calls POST /clips/search-all.
+        "skip_clip_search": is_video_input,
         "format": {
             "name": fmt.name,
             "orientation": fmt.orientation,
@@ -468,6 +478,474 @@ async def create_video(
     return CreateVideoResponse(video_job_id=job_id)
 
 
+async def _enforce_upload_quota(session, settings: Settings, user, *, charge_daily: bool):
+    """Run the per-tier abuse guards shared by upload creation paths.
+
+    Mirrors the inline guards in :func:`create_video`: a concurrency cap and a
+    project cap (both side-effect-free count checks) and, when ``charge_daily``
+    is set, the rolling daily-upload limit. Raises ``HTTPException`` on a breach.
+    """
+
+    db_user = await user_service.get_user(session, user.id)
+    tier = db_user.tier if db_user is not None else tiers.DEFAULT_TIER
+    cfg = tiers.get_tier_config(tier)
+
+    active_jobs = await job_service.count_active_jobs(session, user.id)
+    if (violation := tiers.check_concurrency(tier, active_jobs)) is not None:
+        raise HTTPException(status_code=409, detail=violation.message)
+
+    project_count = await project_service.count_projects(session, user.id)
+    if (violation := tiers.check_project_quota(tier, project_count)) is not None:
+        raise HTTPException(status_code=409, detail=violation.message)
+
+    if charge_daily:
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        await enforce_rate_limit(
+            settings,
+            bucket="create_daily",
+            identity=f"{user.id}:{today}",
+            limit=cfg.daily_uploads,
+            window_s=86_400,
+        )
+
+
+def _resolve_media_ext(content_type: str | None, filename: str | None) -> tuple[str, bool]:
+    """Return (on-disk extension, is_video_input) for an upload's declared type.
+
+    Mirrors the content-type handling in :func:`create_video`. Raises a 400 when
+    a declared content type is present but not in the allow-list.
+    """
+
+    raw_ct = (content_type or "").split(";")[0].strip().lower()
+    if raw_ct and raw_ct not in ALLOWED_MEDIA:
+        raise HTTPException(status_code=400, detail="Unsupported media content type.")
+    ext = _MEDIA_EXT.get(raw_ct) or (Path(filename or "").suffix.lower() or ".bin")
+    is_video = raw_ct in ALLOWED_VIDEO or ext in {
+        ".mp4",
+        ".webm",
+        ".mov",
+        ".mkv",
+        ".ogv",
+        ".mpg",
+    }
+    return ext, is_video
+
+
+async def _enqueue_uploaded_job(
+    session,
+    settings: Settings,
+    user,
+    *,
+    job_id: str,
+    audio_path: Path,
+    audio_object: str | None,
+    is_video_input: bool,
+    fmt,
+    quality_tier: str,
+    subtitles: bool,
+    parsed_sources,
+    credentials: VideoCredentials,
+    title: str,
+    prepared: bool,
+    source_object: str | None = None,
+    extra_payload: dict | None = None,
+) -> None:
+    """Create the project + job rows for an already-stored upload and enqueue it.
+
+    Shared tail of the direct-upload finalize path; mirrors the job-creation
+    block of :func:`create_video` but assumes the media already lives in durable
+    storage at ``audio_object`` (no publish step).
+
+    ``source_object`` is the bucket key whose footage becomes the visual source
+    when it differs from the narration ``audio_object`` (the edit-while-uploading
+    flow transcribes a small WAV but uses the full video as footage). Defaults to
+    ``audio_object`` (the historical case where the upload is both).
+    """
+
+    footage_object = source_object or audio_object
+    source_video = None
+    if is_video_input:
+        if footage_object:
+            try:
+                source_url = await storage.object_download_url(settings, footage_object)
+            except Exception:  # noqa: BLE001 - fall back to local path if URL fails
+                logger.exception("could not resolve source-video URL for job %s", job_id)
+                source_url = str(audio_path)
+        else:
+            source_url = str(audio_path)
+        source_video = {"url": source_url, "kind": "video"}
+
+    payload = {
+        "sources": parsed_sources,
+        "credentials": credentials.model_dump(),
+        "audio_object": audio_object,
+        "source_video": source_video,
+        "theme": {"mode": "script", "vibe": None},
+        "quality": quality_tier,
+        "subtitles": subtitles,
+        "format": {
+            "name": fmt.name,
+            "orientation": fmt.orientation,
+            "width": fmt.width,
+            "height": fmt.height,
+        },
+        "prepared": prepared,
+        # Video uploads show the user's footage on every beat by default; stock
+        # b-roll is only fetched when the editor calls POST /clips/search-all.
+        "skip_clip_search": is_video_input,
+    }
+    if extra_payload:
+        payload.update(extra_payload)
+    input_type = "video_file" if is_video_input else "audio_file"
+    await project_service.create_project(
+        session,
+        job_id,
+        user.id,
+        title=title[:200],
+        input_type=input_type,
+        status="processing",
+    )
+    await job_service.create_video_job(
+        session,
+        job_id,
+        user.id,
+        str(audio_path),
+        payload,
+        owner_id=user.id,
+        project_id=job_id,
+    )
+    await job_queue.transcribe_queue.enqueue(job_id)
+
+
+@app.post(
+    "/videos/upload-url",
+    response_model=UploadUrlResponse,
+    tags=["videos"],
+    summary="Start a direct multipart upload (browser -> bucket)",
+    description=(
+        "Allocates a job id and a presigned multipart upload so the browser can "
+        "PUT the file straight to object storage (no proxy through the API). PUT "
+        "each returned part, then call POST /videos/finalize. 409 when cloud "
+        "storage is not configured (use the multipart-through-proxy POST /videos)."
+    ),
+    responses={400: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+)
+async def create_upload_url(
+    payload: UploadUrlRequest,
+    session: SessionDep,
+    settings: SettingsDep,
+    user: CurrentUserDep,
+) -> UploadUrlResponse:
+    await enforce_rate_limit(
+        settings,
+        bucket="create",
+        identity=user.id,
+        limit=settings.rate_limit_create_per_min,
+    )
+    if not storage.cloud_enabled(settings) or not s3_storage.multipart_upload_enabled(settings):
+        raise HTTPException(
+            status_code=409,
+            detail="Direct upload is not available; use POST /videos.",
+        )
+    if payload.size_bytes > settings.max_upload_bytes:
+        raise HTTPException(status_code=400, detail="File too large.")
+
+    await _enforce_upload_quota(session, settings, user, charge_daily=True)
+
+    ext, _ = _resolve_media_ext(payload.content_type, payload.filename)
+    job_id = str(uuid.uuid4())
+    object_key = f"{storage.source_object_prefix(settings, job_id)}{ext}"
+
+    upload_id = await s3_storage.create_multipart_upload(
+        settings, object_key, payload.content_type or None
+    )
+    part_size, part_count = s3_storage.plan_multipart_parts(
+        payload.size_bytes, settings.upload_part_size_bytes
+    )
+    parts = [
+        UploadPartUrl(
+            part_number=n,
+            url=await s3_storage.presign_upload_part(settings, object_key, upload_id, n),
+        )
+        for n in range(1, part_count + 1)
+    ]
+
+    # Edit-while-uploading: also hand back a single-PUT URL for a client-extracted
+    # narration WAV so transcription can start before the video finishes. The WAV
+    # key shares the job prefix (distinct from the video key by its .wav suffix).
+    audio_object: str | None = None
+    audio_put_url: str | None = None
+    if payload.with_audio:
+        audio_object = f"{storage.source_object_prefix(settings, job_id)}.wav"
+        audio_put_url = await s3_storage.presign_put_url(settings, audio_object)
+
+    logger.info(
+        "planned multipart upload for job %s (%s parts, %s bytes, with_audio=%s)",
+        job_id,
+        part_count,
+        payload.size_bytes,
+        payload.with_audio,
+    )
+    return UploadUrlResponse(
+        video_job_id=job_id,
+        object_key=object_key,
+        upload_id=upload_id,
+        part_size_bytes=part_size,
+        parts=parts,
+        audio_object=audio_object,
+        audio_put_url=audio_put_url,
+    )
+
+
+@app.post(
+    "/videos/start",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=CreateVideoResponse,
+    tags=["videos"],
+    summary="Start transcription from an extracted WAV while the video uploads",
+    description=(
+        "Edit-while-uploading: the browser extracted a small narration WAV and "
+        "PUT it to audio_object; this creates the job and starts transcription "
+        "immediately while the full video uploads in the background to object_key "
+        "(completed later via POST /videos/finalize). Returns 202 with "
+        "video_job_id; poll GET /videos/{id}."
+    ),
+    responses={400: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+)
+async def start_upload(
+    payload: StartUploadRequest,
+    session: SessionDep,
+    settings: SettingsDep,
+    user: CurrentUserDep,
+) -> CreateVideoResponse:
+    from .formats import resolve_format
+
+    if not storage.cloud_enabled(settings):
+        raise HTTPException(
+            status_code=409,
+            detail="Direct upload is not available; use POST /videos.",
+        )
+
+    job_id = payload.video_job_id
+    prefix = storage.source_object_prefix(settings, job_id)
+    if not payload.object_key.startswith(prefix) or not payload.audio_object.startswith(prefix):
+        raise HTTPException(status_code=400, detail="Object keys do not match video_job_id.")
+
+    try:
+        fmt = resolve_format(payload.video_format)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    quality_tier = (payload.quality or DEFAULT_QUALITY).lower()
+    if quality_tier not in ALLOWED_QUALITY:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid quality '{payload.quality}'. Use one of: {sorted(ALLOWED_QUALITY)}.",
+        )
+
+    await _enforce_upload_quota(session, settings, user, charge_daily=False)
+
+    # Validate the extracted narration WAV (small): download once + ffprobe. The
+    # full video footage is validated implicitly when it finishes uploading.
+    work_dir = Path(settings.render_temp_dir) / "uploads" / job_id
+    audio_path = work_dir / "narration.wav"
+    try:
+        await s3_storage.download_file(settings, payload.audio_object, audio_path)
+        await _validate_or_reject(audio_path, settings)
+    except HTTPException:
+        try:
+            await s3_storage.delete_object(settings, payload.audio_object)
+        except Exception:  # noqa: BLE001 - cleanup is best-effort
+            logger.warning("could not delete rejected narration %s", payload.audio_object)
+        raise
+
+    credentials = VideoCredentials(
+        pexels=payload.pexels_key, pixabay=payload.pixabay_key, flickr=payload.flickr_key
+    )
+    title = payload.filename or "Untitled video"
+
+    # Transcribe from the WAV (audio_object); the footage + final-quality audio
+    # come from the uploaded video (source_object), which finalize promotes to
+    # ``render_audio_object`` once its upload completes.
+    await _enqueue_uploaded_job(
+        session,
+        settings,
+        user,
+        job_id=job_id,
+        audio_path=audio_path,
+        audio_object=payload.audio_object,
+        is_video_input=True,
+        fmt=fmt,
+        quality_tier=quality_tier,
+        subtitles=payload.subtitles,
+        parsed_sources=payload.sources,
+        credentials=credentials,
+        title=title,
+        prepared=payload.video_format is not None,
+        source_object=payload.object_key,
+        # Rendering is gated until POST /videos/finalize confirms the full video
+        # finished uploading (the WAV here only drives transcription).
+        extra_payload={"upload_pending": True},
+    )
+    return CreateVideoResponse(video_job_id=job_id)
+
+
+@app.post(
+    "/videos/finalize",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=CreateVideoResponse,
+    tags=["videos"],
+    summary="Finalize a direct multipart upload and enqueue the job",
+    description=(
+        "Completes the multipart upload, validates the stored media (size + "
+        "ffprobe decode + duration cap), then creates the job and starts the "
+        "pipeline. Returns 202 with video_job_id; poll GET /videos/{id}."
+    ),
+    responses={400: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+)
+async def finalize_upload(
+    payload: FinalizeUploadRequest,
+    session: SessionDep,
+    settings: SettingsDep,
+    user: CurrentUserDep,
+) -> CreateVideoResponse:
+    from .formats import resolve_format
+
+    if not storage.cloud_enabled(settings):
+        raise HTTPException(
+            status_code=409,
+            detail="Direct upload is not available; use POST /videos.",
+        )
+
+    job_id = payload.video_job_id
+    # The object key must live under this job's prefix: a client cannot complete
+    # a multipart upload onto an arbitrary key (and the upload_id is unforgeable).
+    if not payload.object_key.startswith(storage.source_object_prefix(settings, job_id)):
+        raise HTTPException(status_code=400, detail="object_key does not match video_job_id.")
+
+    # S3 wants parts ordered with PartNumber/ETag keys.
+    s3_parts = [
+        {"PartNumber": p.part_number, "ETag": p.etag}
+        for p in sorted(payload.parts, key=lambda p: p.part_number)
+    ]
+
+    # Edit-while-uploading: POST /videos/start already created the job and began
+    # transcribing from the extracted WAV. Here we only finish the video upload
+    # and promote the full-quality video to the render's narration source (the
+    # transcript stays driven by the WAV — same audio, matching timestamps).
+    existing = await job_service.get_owned_video_job(session, job_id, user.id)
+    if existing is not None:
+        try:
+            await s3_storage.complete_multipart_upload(
+                settings, payload.object_key, payload.upload_id, s3_parts
+            )
+            size = await s3_storage.head_object_size(settings, payload.object_key)
+            if size > settings.max_upload_bytes:
+                raise HTTPException(status_code=400, detail="File too large.")
+        except HTTPException:
+            try:
+                await s3_storage.delete_object(settings, payload.object_key)
+            except Exception:  # noqa: BLE001 - cleanup is best-effort
+                logger.warning("could not delete rejected upload %s", payload.object_key)
+            raise
+        except Exception as exc:  # noqa: BLE001 - surface a clean client error
+            logger.warning("multipart completion failed for job %s: %s", job_id, exc)
+            raise HTTPException(status_code=400, detail="Could not finalize the upload.") from exc
+
+        merged = dict((existing.payload or {}))
+        merged["render_audio_object"] = payload.object_key
+        # Upload is complete: lift the render gate set by POST /videos/start.
+        merged["upload_pending"] = False
+        await job_service.update_payload(session, job_id, merged)
+        logger.info("finalized background upload for job %s (%s)", job_id, payload.object_key)
+        return CreateVideoResponse(video_job_id=job_id)
+
+    try:
+        fmt = resolve_format(payload.video_format)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    quality_tier = (payload.quality or DEFAULT_QUALITY).lower()
+    if quality_tier not in ALLOWED_QUALITY:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid quality '{payload.quality}'. Use one of: {sorted(ALLOWED_QUALITY)}.",
+        )
+
+    await _enforce_upload_quota(session, settings, user, charge_daily=False)
+
+    try:
+        await s3_storage.complete_multipart_upload(
+            settings, payload.object_key, payload.upload_id, s3_parts
+        )
+    except Exception as exc:  # noqa: BLE001 - surface a clean client error
+        logger.warning("multipart completion failed for job %s: %s", job_id, exc)
+        raise HTTPException(status_code=400, detail="Could not finalize the upload.") from exc
+
+    # Enforce the byte cap against the actual stored size, then validate the
+    # bytes (download once for ffprobe). On any rejection, remove the object so a
+    # bad/oversized upload doesn't linger in the bucket.
+    try:
+        size = await s3_storage.head_object_size(settings, payload.object_key)
+        if size > settings.max_upload_bytes:
+            raise HTTPException(status_code=400, detail="File too large.")
+
+        ext = Path(payload.object_key).suffix or ".bin"
+        work_dir = Path(settings.render_temp_dir) / "uploads" / job_id
+        audio_path = work_dir / f"narration{ext}"
+        await s3_storage.download_file(settings, payload.object_key, audio_path)
+        await _validate_or_reject(audio_path, settings)
+    except HTTPException:
+        try:
+            await s3_storage.delete_object(settings, payload.object_key)
+        except Exception:  # noqa: BLE001 - cleanup is best-effort
+            logger.warning("could not delete rejected upload %s", payload.object_key)
+        raise
+
+    _, is_video_input = _resolve_media_ext(payload.content_type, payload.filename or f"src{ext}")
+    credentials = VideoCredentials(
+        pexels=payload.pexels_key, pixabay=payload.pixabay_key, flickr=payload.flickr_key
+    )
+    title = payload.filename or "Untitled video"
+
+    await _enqueue_uploaded_job(
+        session,
+        settings,
+        user,
+        job_id=job_id,
+        audio_path=audio_path,
+        audio_object=payload.object_key,
+        is_video_input=is_video_input,
+        fmt=fmt,
+        quality_tier=quality_tier,
+        subtitles=payload.subtitles,
+        parsed_sources=payload.sources,
+        credentials=credentials,
+        title=title,
+        prepared=payload.video_format is not None,
+    )
+    return CreateVideoResponse(video_job_id=job_id)
+
+
+def _video_status_response(job, **overrides) -> VideoStatusResponse:
+    """Build a :class:`VideoStatusResponse` from a job row (+ optional overrides)."""
+
+    payload = job.payload or {}
+    fields = {
+        "video_job_id": job.id,
+        "status": job.status,
+        "progress": job.progress,
+        "result_url": None,
+        "error": job.error,
+        "theme": payload.get("theme"),
+        "is_video_input": bool(payload.get("source_video")),
+        "skip_clip_search": payload.get("skip_clip_search"),
+        "upload_pending": payload.get("upload_pending"),
+    }
+    fields.update(overrides)
+    return VideoStatusResponse(**fields)  # type: ignore[arg-type]
+
+
 @app.get(
     "/videos/{video_job_id}",
     response_model=VideoStatusResponse,
@@ -482,18 +960,7 @@ async def get_video(
     job = await job_service.get_owned_video_job(session, video_job_id, user.id)
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown video_job_id.")
-    return VideoStatusResponse(
-        video_job_id=job.id,
-        status=job.status,  # type: ignore[arg-type]
-        progress=job.progress,
-        # Never expose the durable storage URL here — even to the owner. The only
-        # way to fetch a finished video is GET /videos/{id}/download, which
-        # re-checks ownership and returns a short-lived presigned URL (or streams
-        # locally in dev).
-        result_url=None,
-        error=job.error,
-        theme=(job.payload or {}).get("theme"),
-    )
+    return _video_status_response(job)
 
 
 @app.get(
@@ -914,13 +1381,79 @@ async def prepare_video(
     if job.status == "transcribed":
         await job_queue.llm_queue.enqueue_once(video_job_id)
 
-    return VideoStatusResponse(
-        video_job_id=video_job_id,
-        status=job.status,  # type: ignore[arg-type]
-        progress=job.progress,
-        result_url=None,
-        error=None,
+    return _video_status_response(job)
+
+
+@app.post(
+    "/videos/{video_job_id}/clips/search-all",
+    response_model=VideoStatusResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["videos"],
+    summary="Find stock b-roll for every beat (video upload opt-in)",
+    description=(
+        "For a job created from a user video upload that skipped automatic b-roll "
+        "search, this kicks off the LLM + stock clip search for all beats. The "
+        "user's footage stays the default on each beat; stock matches are merged "
+        "in as swappable alternates. Poll GET /videos/{id} and GET /beats until "
+        "status returns to 'ready'."
+    ),
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+    },
+)
+async def search_all_clips(
+    video_job_id: str,
+    session: SessionDep,
+    user: CurrentUserDep,
+) -> VideoStatusResponse:
+    job = await job_service.get_owned_video_job(session, video_job_id, user.id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown video_job_id.")
+
+    payload = job.payload or {}
+    if not payload.get("source_video"):
+        raise HTTPException(
+            status_code=400,
+            detail="This job has no uploaded source video.",
+        )
+    if not payload.get("skip_clip_search"):
+        raise HTTPException(
+            status_code=409,
+            detail="Stock b-roll search has already run (or is not applicable).",
+        )
+    if job.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is '{job.status}'; b-roll search can only start from 'ready'.",
+        )
+
+    merged = dict(payload)
+    merged["skip_clip_search"] = False
+    await job_service.update_payload(session, video_job_id, merged)
+
+    advanced = await job_service.try_advance(
+        session,
+        video_job_id,
+        from_statuses=("ready",),
+        to_status="llm",
+        progress="llm_vocabulary",
     )
+    if not advanced:
+        fresh = await job_service.get_video_job(session, video_job_id)
+        if fresh is None:
+            raise HTTPException(status_code=404, detail="Unknown video_job_id.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is '{fresh.status}'; could not start b-roll search.",
+        )
+
+    await job_queue.llm_queue.enqueue_once(video_job_id)
+    fresh = await job_service.get_video_job(session, video_job_id)
+    if fresh is None:
+        raise HTTPException(status_code=404, detail="Unknown video_job_id.")
+    return _video_status_response(fresh)
 
 
 # Statuses from which a render may be (re)started. Rendering is on demand so the
@@ -970,6 +1503,15 @@ async def render_video(
                 f"Job is '{job.status}'; it can only be rendered once it reaches "
                 f"'ready' (one of {sorted(_RENDERABLE)})."
             ),
+        )
+    # Edit-while-uploading: the full video is still uploading in the background,
+    # so its full-quality footage/audio (render_audio_object) isn't in storage
+    # yet. Refuse to render until POST /videos/finalize clears this flag, rather
+    # than encoding from the low-fidelity transcription WAV / missing footage.
+    if (job.payload or {}).get("upload_pending"):
+        raise HTTPException(
+            status_code=409,
+            detail="The video is still uploading. Rendering will be available once it finishes.",
         )
     # Persist the editor's clip swaps (if any) onto the stored assignments before
     # enqueueing, so the worker — which rebuilds the timeline from the DB — uses
@@ -1186,11 +1728,11 @@ async def download_audio(
     summary="Download the rendered video",
     description=(
         "Returns the finished MP4 for a done job. In local-storage mode the file is "
-        "streamed directly; in B2 mode this redirects (307) to a downloadable B2 URL "
+        "streamed directly; in cloud mode this redirects (307) to a downloadable R2 URL "
         "(presigned/time-limited for private buckets). 409 if the job isn't done yet."
     ),
     responses={
-        307: {"description": "Redirect to the B2 download URL (cloud-storage mode)."},
+        307: {"description": "Redirect to the R2 download URL (cloud-storage mode)."},
         404: {"model": ErrorResponse},
         409: {"model": ErrorResponse},
     },
@@ -1200,7 +1742,7 @@ async def download_video(
 ):
     # Ownership is verified before any URL is produced: a finished video link is
     # only ever returned to its owner, and the cloud URL is a short-lived signed
-    # token (see storage.b2_download_url) — never a public guessable path.
+    # token (see storage.result_download_url) — never a public guessable path.
     job = await job_service.get_owned_video_job(session, video_job_id, user.id)
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown video_job_id.")
@@ -1222,8 +1764,8 @@ async def download_video(
             path, media_type="video/mp4", filename=f"{video_job_id}.mp4"
         )
 
-    # Cloud mode: hand back a downloadable B2 URL (presigned for private buckets).
-    url = await storage.b2_download_url(settings, video_job_id)
+    # Cloud mode: hand back a downloadable R2 URL (presigned for private buckets).
+    url = await storage.result_download_url(settings, video_job_id)
     return RedirectResponse(url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
 

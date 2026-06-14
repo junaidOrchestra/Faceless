@@ -3,6 +3,7 @@
 import * as React from "react";
 import { FileAudio, FileVideo } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { formatUploadLimits, MAX_UPLOAD_BYTES } from "@/lib/upload-limits";
 
 type Kind = "audio" | "video";
 
@@ -56,6 +57,10 @@ export function FileDrop({
           ? "That doesn't look like an audio file. Use mp3, wav, m4a, or weba."
           : "That doesn't look like a video file. Use mp4, webm, or mov.",
       );
+      return;
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setError(`That file is too large. Upload ${formatUploadLimits()}.`);
       return;
     }
     onFile(file);

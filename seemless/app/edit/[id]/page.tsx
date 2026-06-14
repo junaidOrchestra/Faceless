@@ -15,6 +15,7 @@ import {
   stepKeyForPhase,
   useEditorStore,
 } from "@/lib/store";
+import { useBackgroundUpload } from "@/lib/background-upload";
 
 export default function EditorPage() {
   const params = useParams<{ id: string }>();
@@ -67,6 +68,12 @@ export default function EditorPage() {
     [editBeatText],
   );
 
+  // Edit-while-uploading: gate rendering until the background video upload
+  // completes. `uploadPending` (server-truth) survives a refresh; the live
+  // background-upload state adds an instant percentage when present. Called
+  // before any early return so hook order stays stable.
+  const bgUpload = useBackgroundUpload(job?.id);
+
   // The narration filename isn't carried across the upload navigation, so the
   // upload screen stashes it in sessionStorage keyed by job id.
   const storedName =
@@ -108,6 +115,9 @@ export default function EditorPage() {
 
   const { chosen, total } = chosenCount(job);
   const phase = jobPhase(job);
+  const uploadActive = bgUpload?.status === "uploading";
+  const uploadPending = Boolean(job.uploadPending) || uploadActive;
+  const uploadPercent = uploadActive ? Math.round(bgUpload?.percent ?? 0) : undefined;
   // The render view owns the screen while rendering (can't be dismissed) and
   // after it's done (until the user chooses to keep editing).
   const showRender = phase === "rendering" || phase === "failed" || (phase === "done" && !editingAfterDone);
@@ -127,6 +137,8 @@ export default function EditorPage() {
         onMakeVideo={onMakeVideo}
         busy={busy}
         hideMakeVideo={showRender}
+        uploadPending={uploadPending}
+        uploadPercent={uploadPercent}
       />
 
       <main className="mx-auto grid max-w-7xl grid-cols-1 gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[1fr_340px]">
@@ -151,7 +163,14 @@ export default function EditorPage() {
             onRetry={onMakeVideo}
           />
         ) : (
-          <Sidebar job={job} chosen={chosen} total={total} onMakeVideo={onMakeVideo} />
+          <Sidebar
+            job={job}
+            chosen={chosen}
+            total={total}
+            onMakeVideo={onMakeVideo}
+            uploadPending={uploadPending}
+            uploadPercent={uploadPercent}
+          />
         )}
       </main>
 

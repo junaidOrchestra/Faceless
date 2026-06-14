@@ -3,6 +3,7 @@
 import * as React from "react";
 import {
   Clapperboard,
+  Film,
   Music,
   Captions,
   Play,
@@ -12,6 +13,7 @@ import {
   Scissors,
   VolumeX,
   Eraser,
+  Loader2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -120,13 +122,18 @@ export function Sidebar({
   chosen,
   total,
   onMakeVideo,
+  uploadPending = false,
+  uploadPercent,
 }: {
   job: VideoJob;
   chosen: number;
   total: number;
   onMakeVideo: () => void;
+  uploadPending?: boolean;
+  uploadPercent?: number;
 }) {
   const updateSettings = useEditorStore((s) => s.updateSettings);
+  const findBrollForAll = useEditorStore((s) => s.findBrollForAll);
   const ready = total > 0 && chosen >= total;
   const pct = total > 0 ? Math.round((chosen / total) * 100) : 0;
   // Aspect/quality drive the clip search, so they lock once it has started.
@@ -146,6 +153,8 @@ export function Sidebar({
   const silenceSaved = Math.round(
     silenceSpans.reduce((s, [a, b]) => s + Math.max(0, b - a), 0),
   );
+  const [findingBroll, setFindingBroll] = React.useState(false);
+  const showFindBroll = Boolean(job.isVideo && job.skipClipSearch);
 
   return (
     <aside className="space-y-4 lg:sticky lg:top-[136px]">
@@ -157,11 +166,49 @@ export function Sidebar({
         <h3 className="font-heading text-sm font-semibold text-cream">Content theme</h3>
         <ThemeBadge theme={job.theme} />
         <p className="text-xs text-faint">
-          {job.theme.mode === "vibe"
-            ? "Clips come from this vibe, not your narration."
-            : "Clips are matched to what your narration says."}
+          {job.isVideo
+            ? "Your uploaded video is shown on every beat. Add stock b-roll below if you want alternates."
+            : job.theme.mode === "vibe"
+              ? "Clips come from this vibe, not your narration."
+              : "Clips are matched to what your narration says."}
         </p>
       </div>
+
+      {showFindBroll && (
+        <div className="panel space-y-3 p-4">
+          <div className="flex items-center gap-2">
+            <Film className="size-4 text-accent" />
+            <h3 className="font-heading text-sm font-semibold text-cream">Stock b-roll</h3>
+          </div>
+          <p className="text-xs text-faint">
+            Find matching stock clips for every beat. Your footage stays the default; stock
+            clips appear as alternates you can swap per beat.
+          </p>
+          <Button
+            variant="secondary"
+            className="w-full"
+            disabled={findingBroll}
+            onClick={() => {
+              setFindingBroll(true);
+              void findBrollForAll()
+                .catch(() => {})
+                .finally(() => setFindingBroll(false));
+            }}
+          >
+            {findingBroll ? (
+              <>
+                <Loader2 className="size-4 animate-spin" />
+                Finding b-roll…
+              </>
+            ) : (
+              <>
+                <Film className="size-4" />
+                Find b-roll for all
+              </>
+            )}
+          </Button>
+        </div>
+      )}
 
       <div className="panel space-y-4 p-4">
         <div className="flex items-center justify-between">
@@ -318,10 +365,24 @@ export function Sidebar({
         </div>
       </div>
 
-      <Button variant="primary" className="w-full" disabled={!ready} onClick={onMakeVideo}>
-        <Clapperboard className="size-4" />
-        Make video
-      </Button>
+      {uploadPending ? (
+        <div className="space-y-2">
+          <Button variant="primary" className="w-full" disabled>
+            <Loader2 className="size-4 animate-spin" />
+            {uploadPercent != null && uploadPercent < 100
+              ? `Uploading video ${uploadPercent}%…`
+              : "Uploading video…"}
+          </Button>
+          <p className="text-center text-xs text-faint">
+            You can keep editing. Rendering unlocks once the upload finishes.
+          </p>
+        </div>
+      ) : (
+        <Button variant="primary" className="w-full" disabled={!ready} onClick={onMakeVideo}>
+          <Clapperboard className="size-4" />
+          Make video
+        </Button>
+      )}
     </aside>
   );
 }

@@ -41,7 +41,7 @@ export const ORCH_TIMEOUT = {
   status: 12_000,
   beats: 12_000,
   mutate: 20_000,
-  upload: 180_000,
+  upload: 2 * 60 * 60 * 1000,
   streamTtfb: 30_000,
 } as const;
 

@@ -5,6 +5,7 @@ import {
   getVideoJob,
   insertAnimatedBeat as insertAnimatedBeatApi,
   prepareJob,
+  searchAllClips,
   startRender,
   updateBeatText as updateBeatTextApi,
   uploadAnimatedClip as uploadAnimatedClipApi,
@@ -26,6 +27,8 @@ type EditorState = {
   load: (id: string) => Promise<void>;
   stopPolling: () => void;
   prepare: () => Promise<void>;
+  /** Opt-in stock b-roll search for a user-video upload (all beats). */
+  findBrollForAll: () => Promise<void>;
   render: () => Promise<void>;
   chooseAsset: (beatIndex: number, assetId: string) => void;
   toggleBeat: (beatIndex: number) => void;
@@ -195,6 +198,13 @@ function mergeJob(prev: VideoJob | null, incoming: VideoJob): VideoJob {
     fileName: prev.fileName ?? incoming.fileName,
     durationSec: incoming.durationSec ?? prev.durationSec,
     audioUrl: prev.audioUrl ?? incoming.audioUrl,
+    isVideo: incoming.isVideo ?? prev.isVideo,
+    // Once the user opts in, don't let a stale poll flip this back to true.
+    skipClipSearch:
+      prev.skipClipSearch === false ? false : incoming.skipClipSearch ?? prev.skipClipSearch,
+    // Once the upload finishes, don't let a stale poll flip the gate back on.
+    uploadPending:
+      prev.uploadPending === false ? false : incoming.uploadPending ?? prev.uploadPending,
   };
 }
 
@@ -355,9 +365,54 @@ export const useEditorStore = create<EditorState>((set, get) => {
       }
     },
 
+    findBrollForAll: async () => {
+      const { job } = get();
+      if (!job?.isVideo || !job.skipClipSearch) return;
+      set({
+        job: {
+          ...job,
+          skipClipSearch: false,
+          stage: "Finding b-roll",
+          beats: job.beats.map((b) =>
+            b.included && b.visualType !== "text_card"
+              ? { ...b, loading: true, candidates: b.candidates }
+              : b,
+          ),
+        },
+      });
+      try {
+        await searchAllClips(job.id);
+      } catch (e) {
+        const current = get().job;
+        if (current?.id === job.id) {
+          set({
+            job: {
+              ...current,
+              skipClipSearch: true,
+              error: e instanceof Error ? e.message : "Could not start b-roll search.",
+            },
+          });
+        }
+        throw e;
+      }
+    },
+
     render: async () => {
       const { job } = get();
       if (!job || keptBeats(job).length === 0) return;
+      // Edit-while-uploading: the full video is still uploading in the
+      // background, so the backend would reject the render (and we'd otherwise
+      // encode from the low-fidelity transcription WAV). Surface a clear hint
+      // instead of failing the render.
+      if (job.uploadPending) {
+        set({
+          job: {
+            ...job,
+            error: "The video is still uploading. Rendering starts once it finishes.",
+          },
+        });
+        return;
+      }
       // Optimistically flip into the render phase so the UI swaps to the render
       // panel immediately (and a re-render clears a previous result).
       activeId = job.id;

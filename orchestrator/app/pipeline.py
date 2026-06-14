@@ -257,6 +257,60 @@ async def stage_transcribe(
 
 
 # ---------------------------------------------------------------------------
+# Source-footage fast path (video upload — skip automatic b-roll search)
+# ---------------------------------------------------------------------------
+
+
+async def assign_source_footage(
+    session: AsyncSession,
+    job_id: str,
+    payload: dict[str, Any],
+) -> None:
+    """Point every beat at the user's uploaded video (no stock clip search).
+
+    Used when a job is created from a video file and the caller opted out of
+    automatic b-roll. The user can still request stock clips later via
+    POST /videos/{id}/clips/search-all.
+    """
+
+    source_video_url = (payload.get("source_video") or {}).get("url")
+    if not source_video_url:
+        raise RuntimeError(f"job {job_id} has no source_video URL")
+
+    beats = await job_service.get_beats(session, job_id)
+    await job_service.clear_assignments(session, job_id)
+
+    for b in beats:
+        user_candidate = {
+            "platform": "user_video",
+            "kind": "video",
+            "media_url": source_video_url,
+            "preview_url": source_video_url,
+            "score": 1.0,
+            "attribution": "Your footage",
+            "selected": True,
+        }
+        await job_service.save_assignment(
+            session,
+            job_id,
+            b.index,
+            platform="user_video",
+            media_url=source_video_url,
+            kind="video",
+            score=1.0,
+            attribution="Your footage",
+            preview_url=source_video_url,
+            candidates=[user_candidate],
+        )
+
+    logger.info(
+        "job %s: assigned source footage to %s beats (clip search skipped)",
+        job_id,
+        len(beats),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Stage 2: LLM (vocabulary + per-beat queries) + submit clip search
 # ---------------------------------------------------------------------------
 
@@ -287,11 +341,23 @@ async def stage_llm(
     if not beats:
         return False
 
+    # Video upload fast path: show the user's footage on every beat and skip the
+    # LLM + stock clip search until they opt in via POST /clips/search-all.
+    source_video_url = (payload.get("source_video") or {}).get("url")
+    theme = payload.get("theme") or {}
+    if (
+        payload.get("skip_clip_search")
+        and source_video_url
+        and str(theme.get("mode") or "script").lower() != "vibe"
+    ):
+        await job_service.set_progress(session, job_id, "source_footage")
+        await assign_source_footage(session, job_id, payload)
+        return False
+
     # Vibe mode: the user chose a visual theme instead of "match my script". Skip
     # the transcript-driven vocabulary + visual director entirely and hand off to
     # the separate vibe pipeline, which fetches an UNRANKED pool of theme clips
     # (tiled by duration into beats once the search completes).
-    theme = payload.get("theme") or {}
     if str(theme.get("mode") or "script").lower() == "vibe" and vibe_registry.is_vibe(
         theme.get("vibe")
     ):
@@ -464,11 +530,9 @@ async def apply_clip_result(
     by_ref = {item.ref: item for item in status.items}
     beats = await job_service.get_beats(session, job_id)
 
-    # If the narration came from a user video, that footage is offered as a
-    # swappable alternate on every beat — but the DEFAULT (rendered) pick is the
-    # best-ranked stock match for the beat's text. The user's footage only
-    # becomes the default when no stock asset matched the beat (it always covers
-    # the beat, so there is still no text fallback in this mode). See below.
+    # If the narration came from a user video, that footage is the DEFAULT on
+    # every beat; stock matches (when the user opted in via /clips/search-all)
+    # are merged in as swappable alternates. See below.
     source_video_url = (payload.get("source_video") or {}).get("url")
 
     # Re-run safety: clear any assignments from a previous (interrupted) poll.
@@ -525,10 +589,8 @@ async def apply_clip_result(
                 stock_candidates.append(_asset_to_candidate(alt, selected=False))
 
         if source_video_url:
-            # The user's footage is always an available candidate, but it is no
-            # longer auto-selected: the best-ranked stock match leads. The user
-            # video is sliced to this beat's window at render time (the renderer
-            # seeks to beat.start_s) only if the user picks it.
+            # The user's footage is the default; stock matches (when requested via
+            # POST /clips/search-all) are merged in as swappable alternates.
             user_candidate = {
                 "platform": "user_video",
                 "kind": "video",
@@ -536,32 +598,13 @@ async def apply_clip_result(
                 "preview_url": source_video_url,
                 "score": 1.0,
                 "attribution": "Your footage",
-                "selected": False,
+                "selected": True,
             }
             if asset is not None:
-                # Stock best match is the default; user footage trails as an
-                # alternate the user can switch to.
                 candidates = [
-                    {**stock_candidates[0], "selected": True},
-                    *stock_candidates[1:],
                     user_candidate,
+                    *[{**c, "selected": False} for c in stock_candidates],
                 ][:4]
-                await job_service.save_assignment(
-                    session,
-                    job_id,
-                    b.index,
-                    platform=asset.platform,
-                    media_url=asset.media_url,
-                    kind=asset.kind,
-                    score=asset.score,
-                    attribution=asset.attribution_name,
-                    preview_url=asset.preview_url,
-                    candidates=candidates,
-                )
-            else:
-                # No stock match for this beat — fall back to the user's footage
-                # as the default (better than a text card when we have footage).
-                user_candidate["selected"] = True
                 await job_service.save_assignment(
                     session,
                     job_id,
@@ -572,7 +615,21 @@ async def apply_clip_result(
                     score=1.0,
                     attribution="Your footage",
                     preview_url=source_video_url,
-                    candidates=[user_candidate, *stock_candidates][:4],
+                    candidates=candidates,
+                )
+            else:
+                # No stock match for this beat — user footage only.
+                await job_service.save_assignment(
+                    session,
+                    job_id,
+                    b.index,
+                    platform="user_video",
+                    media_url=source_video_url,
+                    kind="video",
+                    score=1.0,
+                    attribution="Your footage",
+                    preview_url=source_video_url,
+                    candidates=[user_candidate],
                 )
             visual_beats += 1
             continue
@@ -665,9 +722,27 @@ async def stage_render(
     # Render is on-demand and may run after a restart that wiped ephemeral /tmp,
     # so make sure the narration is present locally (re-fetch from B2 if needed)
     # before ffprobe/ffmpeg touch it.
-    audio_path = await storage.ensure_local_audio(
-        settings, audio_path, payload.get("audio_object")
-    )
+    #
+    # Edit-while-uploading transcribes from a small 16 kHz WAV (``audio_object``)
+    # but stores the full-quality narration in the uploaded video
+    # (``render_audio_object``). Prefer the latter for the final mux so the output
+    # keeps full audio fidelity; the transcript timestamps still match (same
+    # source audio). It downloads to a distinct path so it never collides with the
+    # WAV the transcribe stage already fetched.
+    render_audio_object = payload.get("render_audio_object")
+    if render_audio_object and render_audio_object != payload.get("audio_object"):
+        render_audio_path = str(
+            Path(audio_path).with_name(
+                f"render_audio{Path(render_audio_object).suffix or '.bin'}"
+            )
+        )
+        audio_path = await storage.ensure_local_audio(
+            settings, render_audio_path, render_audio_object
+        )
+    else:
+        audio_path = await storage.ensure_local_audio(
+            settings, audio_path, payload.get("audio_object")
+        )
 
     timing_segments = [
         BeatTiming(

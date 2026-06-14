@@ -364,7 +364,7 @@ class PipelineWorkers:
                 logger.info("job %s on llm queue but not prepared; skipping", job_id)
                 return
             job = await job_service.claim_for_stage(
-                session, job_id, from_statuses=("transcribed", "llm"), to_status="llm"
+                session, job_id, from_statuses=("transcribed", "llm", "ready"), to_status="llm"
             )
             if job is None:
                 return

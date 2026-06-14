@@ -45,8 +45,8 @@ def _sniff_mime(path: Path) -> str | None:
     return kind.mime if kind else None
 
 
-def _probe_codec_types(path: Path, timeout_s: float) -> list[str]:
-    """Return the ``codec_type`` of every stream via ffprobe, or raise.
+def _probe_media(path: Path, timeout_s: float) -> tuple[list[str], float | None]:
+    """Return stream codec types and container duration via ffprobe, or raise.
 
     ``timeout`` makes ``subprocess.run`` SIGKILL ffprobe on expiry so a malicious
     or pathological file cannot wedge the worker thread indefinitely.
@@ -58,7 +58,7 @@ def _probe_codec_types(path: Path, timeout_s: float) -> list[str]:
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_type",
+            "stream=codec_type:format=duration",
             "-of",
             "json",
             str(path),
@@ -69,7 +69,13 @@ def _probe_codec_types(path: Path, timeout_s: float) -> list[str]:
         timeout=timeout_s,
     )
     data = json.loads(proc.stdout or "{}")
-    return [str(stream.get("codec_type") or "") for stream in data.get("streams", [])]
+    codec_types = [str(stream.get("codec_type") or "") for stream in data.get("streams", [])]
+    raw_duration = data.get("format", {}).get("duration")
+    try:
+        duration_s = float(raw_duration) if raw_duration is not None else None
+    except (TypeError, ValueError):
+        duration_s = None
+    return codec_types, duration_s
 
 
 async def validate_media_file(
@@ -77,6 +83,7 @@ async def validate_media_file(
     *,
     probe_timeout_s: float,
     require_audio: bool = True,
+    max_duration_s: float | None = None,
 ) -> None:
     """Validate that ``path`` is a decodable audio/video file with an audio track.
 
@@ -95,7 +102,7 @@ async def validate_media_file(
 
     # 2) ffprobe decode probe with a hard timeout.
     try:
-        codec_types = await asyncio.to_thread(_probe_codec_types, path, probe_timeout_s)
+        codec_types, duration_s = await asyncio.to_thread(_probe_media, path, probe_timeout_s)
     except subprocess.TimeoutExpired as exc:
         logger.warning("ffprobe timed out validating %s", path)
         raise MediaValidationError(
@@ -117,4 +124,13 @@ async def validate_media_file(
     if require_audio and "audio" not in codec_types:
         raise MediaValidationError(
             "No audio track found — narration audio is required for transcription."
+        )
+    if (
+        max_duration_s is not None
+        and max_duration_s > 0
+        and duration_s is not None
+        and duration_s > max_duration_s
+    ):
+        raise MediaValidationError(
+            f"Media is {duration_s:.0f}s but uploads are limited to {max_duration_s:.0f}s."
         )

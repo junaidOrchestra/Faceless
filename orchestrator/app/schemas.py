@@ -32,6 +32,96 @@ class CreateVideoResponse(BaseModel):
     video_job_id: str = Field(..., examples=["vid-abc"])
 
 
+class UploadUrlRequest(BaseModel):
+    """Request a direct multipart upload session (browser -> bucket)."""
+
+    filename: str | None = Field(default=None, description="Original file name (for the title + extension).")
+    content_type: str | None = Field(default=None, description="Browser-declared MIME type.")
+    size_bytes: int = Field(..., gt=0, description="Total file size in bytes (used to plan parts).")
+    with_audio: bool = Field(
+        default=False,
+        description=(
+            "Also return a presigned PUT URL for a client-extracted narration WAV "
+            "so transcription can start before the full video finishes uploading."
+        ),
+    )
+
+
+class UploadPartUrl(BaseModel):
+    part_number: int = Field(..., description="1-based S3 multipart part number.")
+    url: str = Field(..., description="Presigned PUT URL for this part.")
+
+
+class UploadUrlResponse(BaseModel):
+    """A planned multipart upload: PUT each part to its URL, then call finalize."""
+
+    video_job_id: str
+    object_key: str = Field(..., description="Bucket key the parts upload into.")
+    upload_id: str = Field(..., description="S3 multipart upload id.")
+    part_size_bytes: int = Field(..., description="Byte size of every part except the last.")
+    parts: list[UploadPartUrl]
+    audio_object: str | None = Field(
+        default=None, description="Bucket key for the narration WAV (when with_audio)."
+    )
+    audio_put_url: str | None = Field(
+        default=None, description="Presigned single-PUT URL for the narration WAV."
+    )
+
+
+class StartUploadRequest(BaseModel):
+    """Start transcription from a client-extracted WAV while the video uploads.
+
+    The narration WAV has already been PUT to ``audio_object``; the full video is
+    still uploading to ``object_key`` (completed later via POST /videos/finalize).
+    """
+
+    video_job_id: str
+    object_key: str = Field(..., description="Bucket key the video is uploading to.")
+    audio_object: str = Field(..., description="Bucket key of the already-uploaded narration WAV.")
+    filename: str | None = None
+    content_type: str | None = None
+    video_format: str | None = Field(default=None, alias="format")
+    quality: str | None = None
+    subtitles: bool = False
+    sources: list[str] | None = None
+    pexels_key: str | None = None
+    pixabay_key: str | None = None
+    flickr_key: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class UploadedPartIn(BaseModel):
+    part_number: int
+    etag: str = Field(..., description="ETag returned by the part PUT response.")
+
+
+class FinalizeUploadRequest(BaseModel):
+    """Complete a multipart upload and enqueue the job for the stored object."""
+
+    video_job_id: str
+    object_key: str
+    upload_id: str
+    parts: list[UploadedPartIn] = Field(..., min_length=1)
+    filename: str | None = None
+    content_type: str | None = None
+    video_format: str | None = Field(
+        default=None,
+        alias="format",
+        description="Output format/aspect (same values as POST /videos 'format').",
+    )
+    quality: str | None = None
+    subtitles: bool = False
+    sources: list[str] | None = None
+    pexels_key: str | None = None
+    pixabay_key: str | None = None
+    flickr_key: str | None = None
+    # Accepted for forward-compat with the edit-while-uploading flow; unused here.
+    transcribe_audio_object: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class ThemeChoice(BaseModel):
     """Content theme: match the script, or fill every beat from a chosen vibe.
 
@@ -149,6 +239,15 @@ class VideoStatusResponse(BaseModel):
     # from the job payload so the editor's pick-clips/render screens can show
     # which theme is in effect. Defaults to script when unset.
     theme: ThemeChoice | None = None
+    # True when the job was created from a user video upload (footage is available
+    # as the default visual on every beat).
+    is_video_input: bool = False
+    # When true, automatic stock b-roll search was skipped; the editor can opt
+    # in via POST /videos/{id}/clips/search-all.
+    skip_clip_search: bool | None = None
+    # True while the full video is still uploading in the background (edit-while-
+    # uploading). Rendering is gated until POST /videos/finalize clears it.
+    upload_pending: bool | None = None
 
 
 class BeatAssignmentOut(BaseModel):

@@ -15,11 +15,12 @@ import {
   orchGetVideoJob,
   orchInsertAnimatedBeat,
   orchPrepare,
+  orchSearchAllClips,
   orchSearchClips,
   orchStartRender,
   orchUpdateBeatText,
   orchUploadAnimatedClip,
-  orchUploadAudio,
+  orchUploadAudioDirect,
   orchUploadOwnClip,
 } from "./orchestrator";
 
@@ -132,12 +133,13 @@ function mockSnapshot(entry: MockEntry): VideoJob {
   };
 }
 
-/** POST /videos — upload narration audio, returns the new job id. */
+/** POST /videos — upload narration audio (direct multipart), returns the job id. */
 export async function uploadAudio(
   file: File,
   signal?: AbortSignal,
+  onProgress?: (percent: number) => void,
 ): Promise<{ videoJobId: string }> {
-  if (USE_ORCHESTRATOR) return orchUploadAudio(file, signal);
+  if (USE_ORCHESTRATOR) return orchUploadAudioDirect(file, signal, onProgress);
 
   await sleep(900); // simulate upload + 202 Accepted
   const videoJobId =
@@ -170,6 +172,16 @@ export type PrepareOpts = {
 export async function prepareJob(jobId: string, opts: PrepareOpts): Promise<void> {
   if (USE_ORCHESTRATOR) {
     await orchPrepare(jobId, opts);
+    return;
+  }
+  await sleep(400);
+  mockPrepare(jobId);
+}
+
+/** POST /videos/{id}/clips/search-all — find stock b-roll for a video upload. */
+export async function searchAllClips(jobId: string): Promise<void> {
+  if (USE_ORCHESTRATOR) {
+    await orchSearchAllClips(jobId);
     return;
   }
   await sleep(400);

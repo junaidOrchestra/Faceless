@@ -132,6 +132,13 @@ export type VideoJob = {
   fileName?: string;
   durationSec?: number;
   audioUrl?: string;
+  /** True when the job was created from a user video upload. */
+  isVideo?: boolean;
+  /** When true, stock b-roll was not fetched yet (user footage only). */
+  skipClipSearch?: boolean;
+  /** True while the full video is still uploading in the background (edit-while-
+   * uploading). Rendering is gated until the upload finishes. */
+  uploadPending?: boolean;
 };
 
 export const VISUAL_TYPE_LABEL: Record<VisualType, string> = {

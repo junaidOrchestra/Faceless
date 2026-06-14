@@ -15,6 +15,7 @@ import type { RelWord } from "./animated-text";
 import { relWordsToWire } from "./animated-text";
 import type { VibeId } from "./vibes";
 import { getPreviewAudioUrl } from "./preview-audio";
+import { uploadFileMultipart, type UploadedPart } from "./b2-upload";
 
 // Flip to true once the orchestrator exposes GET /videos/{id}/audio (so the
 // synced preview survives a page refresh / shared link). Until then the preview
@@ -232,6 +233,170 @@ export async function orchUploadAudio(
   return { videoJobId: data.video_job_id };
 }
 
+// A planned direct-to-bucket multipart upload returned by POST /videos/upload-url.
+export type UploadSlot = {
+  videoJobId: string;
+  objectKey: string;
+  uploadId: string;
+  partSizeBytes: number;
+  partUrls: { partNumber: number; url: string }[];
+  // Present when the slot was requested with audio: a single-PUT URL + key for a
+  // client-extracted narration WAV (edit-while-uploading early transcription).
+  audioObject?: string;
+  audioPutUrl?: string;
+};
+
+/** Output choices forwarded to finalize (all optional; matches POST /videos). */
+export type FinalizeUploadOpts = {
+  format?: string;
+  quality?: string;
+  subtitles?: boolean;
+};
+
+/**
+ * Ask the orchestrator to plan a direct multipart upload for `file`.
+ *
+ * Returns null when the backend has no cloud storage configured (local/dev),
+ * signalling the caller to fall back to the proxy upload (POST /api/videos).
+ */
+export async function orchRequestUploadSlot(
+  file: File,
+  opts?: { withAudio?: boolean },
+): Promise<UploadSlot | null> {
+  const res = await fetch("/api/videos/upload-url", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: file.name,
+      content_type: file.type,
+      size_bytes: file.size,
+      with_audio: opts?.withAudio ?? false,
+    }),
+  });
+  // 409 = direct upload unavailable (cloud storage not configured) -> fall back.
+  if (res.status === 409) return null;
+  const data = await jsonOrThrow(res);
+  return {
+    videoJobId: data.video_job_id,
+    objectKey: data.object_key,
+    uploadId: data.upload_id,
+    partSizeBytes: data.part_size_bytes,
+    partUrls: (data.parts ?? []).map(
+      (p: { part_number: number; url: string }) => ({
+        partNumber: p.part_number,
+        url: p.url,
+      }),
+    ),
+    audioObject: data.audio_object ?? undefined,
+    audioPutUrl: data.audio_put_url ?? undefined,
+  };
+}
+
+/** PUT a whole small object (e.g. the extracted narration WAV) to a presigned URL. */
+export async function orchPutObject(
+  url: string,
+  body: Blob,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(url, { method: "PUT", body, signal });
+  if (!res.ok) {
+    throw new Error(`Audio upload failed (${res.status}).`);
+  }
+}
+
+/**
+ * Edit-while-uploading: create the job and start transcribing from a narration
+ * WAV that was already PUT to `slot.audioObject`, while the full video keeps
+ * uploading in the background to `slot.objectKey`.
+ */
+export async function orchStartFromAudio(
+  slot: UploadSlot,
+  file: File,
+  opts?: FinalizeUploadOpts,
+): Promise<{ videoJobId: string }> {
+  if (!slot.audioObject) {
+    throw new Error("Upload slot is missing a narration audio object.");
+  }
+  const startOpts: FinalizeUploadOpts = {
+    format: "portrait",
+    quality: "hd",
+    subtitles: true,
+    ...(opts ?? {}),
+  };
+  const data = await jsonOrThrow(
+    await fetch("/api/videos/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        video_job_id: slot.videoJobId,
+        object_key: slot.objectKey,
+        audio_object: slot.audioObject,
+        filename: file.name,
+        content_type: file.type,
+        ...startOpts,
+      }),
+    }),
+  );
+  return { videoJobId: data.video_job_id };
+}
+
+/** Complete a finished multipart upload and enqueue the job for processing. */
+export async function orchFinalizeUpload(
+  slot: UploadSlot,
+  file: File,
+  parts: UploadedPart[],
+  opts?: FinalizeUploadOpts,
+  transcribeAudioObject?: string,
+): Promise<{ videoJobId: string }> {
+  const finalizeOpts: FinalizeUploadOpts = {
+    // Match the editor's initial defaults so direct uploads do not pause in the
+    // backend's "transcribed; awaiting /prepare" state.
+    format: "portrait",
+    quality: "hd",
+    subtitles: true,
+    ...(opts ?? {}),
+  };
+  const data = await jsonOrThrow(
+    await fetch("/api/videos/finalize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        video_job_id: slot.videoJobId,
+        object_key: slot.objectKey,
+        upload_id: slot.uploadId,
+        filename: file.name,
+        content_type: file.type,
+        parts: parts.map((p) => ({ part_number: p.partNumber, etag: p.etag })),
+        transcribe_audio_object: transcribeAudioObject,
+        ...finalizeOpts,
+      }),
+    }),
+  );
+  return { videoJobId: data.video_job_id };
+}
+
+/**
+ * Upload narration directly to object storage in parallel multipart chunks,
+ * then finalize. Falls back to the proxy upload when the backend has no cloud
+ * storage configured (e.g. local dev), so the flow works everywhere.
+ */
+export async function orchUploadAudioDirect(
+  file: File,
+  signal?: AbortSignal,
+  onProgress?: (percent: number) => void,
+): Promise<{ videoJobId: string }> {
+  const slot = await orchRequestUploadSlot(file);
+  if (!slot) return orchUploadAudio(file, signal);
+  const parts = await uploadFileMultipart(
+    file,
+    slot.partUrls,
+    slot.partSizeBytes,
+    onProgress,
+    signal,
+  );
+  return orchFinalizeUpload(slot, file, parts);
+}
+
 export async function orchGetVideoJob(id: string): Promise<VideoJob> {
   const [statusRes, beatsRes] = await Promise.all([
     fetch(`/api/videos/${id}`),
@@ -272,6 +437,9 @@ export async function orchGetVideoJob(id: string): Promise<VideoJob> {
     resultUrl:
       status.status === "done" ? `/api/videos/${id}/download` : undefined,
     durationSec,
+    isVideo: Boolean(status.is_video_input),
+    skipClipSearch: status.skip_clip_search ?? undefined,
+    uploadPending: status.upload_pending ?? undefined,
     // Prefer the in-memory blob from this upload session (instant, always
     // works). The /api/videos/{id}/audio proxy is only a usable fallback once
     // the orchestrator ships the matching endpoint — until then it 404s, so we
@@ -370,6 +538,13 @@ export async function orchPrepare(
     return;
   }
   await jsonOrThrow(res);
+}
+
+/** Opt-in stock b-roll search for every beat on a user-video upload job. */
+export async function orchSearchAllClips(id: string): Promise<void> {
+  await jsonOrThrow(
+    await fetch(`/api/videos/${id}/clips/search-all`, { method: "POST" }),
+  );
 }
 
 // TODO: the orchestrator has no per-beat live search / user-upload endpoint yet.

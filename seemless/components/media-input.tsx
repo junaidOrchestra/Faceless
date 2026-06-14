@@ -4,10 +4,12 @@ import * as React from "react";
 import { useRouter } from "next/navigation";
 import { FileAudio, FileVideo, Loader2, Mic, Video } from "lucide-react";
 import { uploadAudio } from "@/lib/api";
+import { startVideoWithEarlyTranscribe } from "@/lib/background-upload";
 import { rememberPreviewAudio, prewarmPreviewAudio } from "@/lib/preview-audio";
 import { FileDrop } from "@/components/file-drop";
 import { Recorder } from "@/components/recorder";
 import { cn } from "@/lib/utils";
+import { formatUploadLimits, MAX_UPLOAD_BYTES } from "@/lib/upload-limits";
 
 type Mode = "audio-file" | "video-file" | "record-audio" | "record-video";
 
@@ -18,15 +20,16 @@ const TABS: { mode: Mode; label: string; icon: typeof FileAudio }[] = [
   { mode: "record-video", label: "Record video", icon: Video },
 ];
 
-// An upload that never completes (huge file / wedged proxy) must not pin the
-// home screen on "Uploading…" forever.
-const UPLOAD_TIMEOUT_MS = 180_000;
+// Large 3 GB uploads can legitimately take a long time on slow connections, but
+// a wedged proxy still needs a backstop.
+const UPLOAD_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 
 export function MediaInput() {
   const router = useRouter();
   const [mode, setMode] = React.useState<Mode>("audio-file");
   const [busy, setBusy] = React.useState(false);
   const [busyName, setBusyName] = React.useState<string | null>(null);
+  const [progress, setProgress] = React.useState(0);
   const [error, setError] = React.useState<string | null>(null);
   const abortRef = React.useRef<AbortController | null>(null);
 
@@ -39,13 +42,30 @@ export function MediaInput() {
   const submit = React.useCallback(
     async (file: File) => {
       setError(null);
+      if (file.size > MAX_UPLOAD_BYTES) {
+        setError(`That file is too large. Upload ${formatUploadLimits()}.`);
+        return;
+      }
       setBusy(true);
       setBusyName(file.name);
+      setProgress(0);
       const controller = new AbortController();
       abortRef.current = controller;
       const timer = setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS);
       try {
-        const { videoJobId } = await uploadAudio(file, controller.signal);
+        // For a video, extract its audio in the browser and start transcription
+        // immediately while the full video uploads in the background — the editor
+        // opens right away. Falls back to a regular upload when extraction isn't
+        // possible (or direct-to-bucket storage isn't configured).
+        let videoJobId: string | null = null;
+        if (file.type.startsWith("video/")) {
+          videoJobId = await startVideoWithEarlyTranscribe(file, controller.signal);
+        }
+        if (!videoJobId) {
+          ({ videoJobId } = await uploadAudio(file, controller.signal, (pct) =>
+            setProgress(pct),
+          ));
+        }
         // The synced preview plays the narration from this blob (the audio track
         // for video inputs), so remember it for any media file.
         const previewUrl = rememberPreviewAudio(videoJobId, file);
@@ -116,7 +136,11 @@ export function MediaInput() {
             <p className="font-heading text-lg font-semibold text-cream">
               Uploading {busyName}…
             </p>
-            <p className="text-sm text-faint">Transcribing and finding your beats.</p>
+            <p className="text-sm text-faint">
+              {progress > 0 && progress < 100
+                ? `${Math.round(progress)}% uploaded`
+                : "Transcribing and finding your beats."}
+            </p>
           </div>
           <button
             type="button"
